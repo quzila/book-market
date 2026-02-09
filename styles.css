@@ -460,12 +460,6 @@ button:focus-visible {
   border: 1px solid var(--line);
 }
 
-.batch-tools {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
 .queued-section {
   margin-top: 4px;
 }
@@ -480,6 +474,16 @@ button:focus-visible {
   border-radius: var(--radius-sm);
   padding: 12px 14px;
   font-weight: 700;
+}
+
+.submit-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.submit-stack .plain-btn,
+.submit-stack .submit-btn {
+  width: 100%;
 }
 
 .stack-section {

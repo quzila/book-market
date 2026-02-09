@@ -117,7 +117,6 @@ import "./config.js";
     imageInput: byId("imageInput"),
     imagePreview: byId("imagePreview"),
     queueListingButton: byId("queueListingButton"),
-    submitQueuedListingsButton: byId("submitQueuedListingsButton"),
     queuedListingsSection: byId("queuedListingsSection"),
     queuedListingsList: byId("queuedListingsList"),
     queuedListingsEmpty: byId("queuedListingsEmpty"),
@@ -196,7 +195,6 @@ import "./config.js";
       "listingGrid",
       "listingForm",
       "queueListingButton",
-      "submitQueuedListingsButton",
       "queuedListingsList",
       "myConflictSection",
       "loginModal",
@@ -275,7 +273,6 @@ import "./config.js";
     dom.imageInput.addEventListener("change", handleImagePreview);
     dom.listingForm.addEventListener("submit", handleSubmitListing);
     dom.queueListingButton.addEventListener("click", handleQueueListing);
-    dom.submitQueuedListingsButton.addEventListener("click", handleSubmitQueuedListings);
     dom.queuedListingsList.addEventListener("click", handleQueueActionClick);
 
     dom.reloadMyPageButton.addEventListener("click", () => {
@@ -418,7 +415,6 @@ import "./config.js";
 
     dom.submitListingButton.disabled = !canPost;
     dom.queueListingButton.disabled = !canPost;
-    dom.submitQueuedListingsButton.disabled = !canPost || !state.seller.draftQueue.length;
     dom.myConflictSection.classList.toggle("hidden", !canViewConflictSection());
   }
 
@@ -1353,27 +1349,60 @@ import "./config.js";
 
     setListingActionBusy(true);
     try {
-      const draft = await buildListingDraftFromForm();
-      const listing = await materializeListingFromDraft(draft, 1, 1);
-      setStatus(dom.listingStatus, "出品を登録中...");
-
-      const result = await apiPost(
-        "addListing",
-        {
-          sellerId: state.session.userId,
-          sellerName: state.session.name,
-          listing,
-        },
-        90000,
-        1
-      );
-
-      if (!result.ok) {
-        throw new Error(result.error || "出品登録に失敗しました。");
+      const drafts = state.seller.draftQueue.slice();
+      if (isListingFormDirty()) {
+        const currentDraft = await buildListingDraftFromForm();
+        drafts.push(currentDraft);
       }
 
+      if (!drafts.length) {
+        throw new Error("出品する商品を入力してください。");
+      }
+
+      const listings = [];
+      for (let i = 0; i < drafts.length; i += 1) {
+        setStatus(dom.listingStatus, `出品準備中 (${i + 1}/${drafts.length}) ...`);
+        listings.push(await materializeListingFromDraft(drafts[i], i + 1, drafts.length));
+      }
+
+      if (listings.length === 1) {
+        setStatus(dom.listingStatus, "出品を登録中...");
+        const result = await apiPost(
+          "addListing",
+          {
+            sellerId: state.session.userId,
+            sellerName: state.session.name,
+            listing: listings[0],
+          },
+          90000,
+          1
+        );
+
+        if (!result.ok) {
+          throw new Error(result.error || "出品登録に失敗しました。");
+        }
+      } else {
+        setStatus(dom.listingStatus, `一括出品を登録中 (${listings.length}件) ...`);
+        const result = await apiPost(
+          "addListingsBatch",
+          {
+            sellerId: state.session.userId,
+            sellerName: state.session.name,
+            listings,
+          },
+          180000,
+          1
+        );
+
+        if (!result.ok) {
+          throw new Error(result.error || "一括出品に失敗しました。");
+        }
+      }
+
+      state.seller.draftQueue = [];
+      renderQueuedListings();
       resetListingFormInputs();
-      setStatus(dom.listingStatus, "出品しました。", "ok");
+      setStatus(dom.listingStatus, `${listings.length}件を出品しました。`, "ok");
       switchTab("home");
       await refreshListings();
     } catch (error) {
@@ -1404,59 +1433,7 @@ import "./config.js";
       state.seller.draftQueue.push(draft);
       renderQueuedListings();
       resetListingFormInputs();
-      setStatus(dom.listingStatus, `${state.seller.draftQueue.length}件を一括出品リストに追加しました。`, "ok");
-    } catch (error) {
-      setStatus(dom.listingStatus, String(error.message || error), "error");
-    } finally {
-      setListingActionBusy(false);
-      applyAccessState();
-    }
-  }
-
-  async function handleSubmitQueuedListings() {
-    if (!state.session) {
-      openLoginModal();
-      return;
-    }
-    if (!state.seller.draftQueue.length) {
-      setStatus(dom.listingStatus, "一括出品リストが空です。", "error");
-      return;
-    }
-
-    setListingActionBusy(true);
-    try {
-      const drafts = state.seller.draftQueue.slice();
-      const listings = [];
-      for (let i = 0; i < drafts.length; i += 1) {
-        setStatus(dom.listingStatus, `一括出品の準備中 (${i + 1}/${drafts.length}) ...`);
-        const listing = await materializeListingFromDraft(drafts[i], i + 1, drafts.length);
-        listings.push(listing);
-      }
-
-      setStatus(dom.listingStatus, `一括出品を登録中 (${listings.length}件) ...`);
-      const result = await apiPost(
-        "addListingsBatch",
-        {
-          sellerId: state.session.userId,
-          sellerName: state.session.name,
-          listings,
-        },
-        180000,
-        1
-      );
-
-      if (!result.ok) {
-        throw new Error(result.error || "一括出品に失敗しました。");
-      }
-
-      state.seller.draftQueue = [];
-      renderQueuedListings();
-      setStatus(dom.listingStatus, `${Number(result.createdCount || listings.length)}件を出品しました。`, "ok");
-      switchTab("home");
-      await refreshListings();
-      if (state.activeTab === "my") {
-        await refreshMyPage();
-      }
+      setStatus(dom.listingStatus, "商品を登録しました。続けて入力できます。", "ok");
     } catch (error) {
       setStatus(dom.listingStatus, String(error.message || error), "error");
     } finally {
@@ -1481,7 +1458,6 @@ import "./config.js";
     const drafts = Array.isArray(state.seller.draftQueue) ? state.seller.draftQueue : [];
     if (!drafts.length) {
       dom.queuedListingsEmpty.classList.remove("hidden");
-      dom.submitQueuedListingsButton.textContent = "まとめて出品する";
       return;
     }
 
@@ -1520,8 +1496,6 @@ import "./config.js";
       item.appendChild(meta);
       dom.queuedListingsList.appendChild(item);
     });
-
-    dom.submitQueuedListingsButton.textContent = `まとめて出品する (${drafts.length}件)`;
   }
 
   async function buildListingDraftFromForm() {
@@ -1607,10 +1581,27 @@ import "./config.js";
     syncBookFieldVisibility();
   }
 
+  function isListingFormDirty() {
+    const textValues = [
+      dom.categoryInput.value,
+      dom.titleInput.value,
+      dom.descriptionInput.value,
+      dom.janInput.value,
+      dom.authorInput.value,
+      dom.publisherInput.value,
+      dom.publishedDateInput.value,
+      dom.subjectFreeInput.value,
+    ];
+    const hasText = textValues.some((value) => normalizeText(value));
+    const hasImages = Array.from(dom.imageInput.files || []).length > 0;
+    const hasSubjectChecks = Array.from(dom.subjectTags.querySelectorAll("input[type='checkbox']:checked")).length > 0;
+    const itemTypeChanged = normalizeItemType(dom.itemTypeInput.value) !== "book";
+    return hasText || hasImages || hasSubjectChecks || itemTypeChanged;
+  }
+
   function setListingActionBusy(isBusy) {
     dom.submitListingButton.disabled = isBusy;
     dom.queueListingButton.disabled = isBusy;
-    dom.submitQueuedListingsButton.disabled = isBusy || !state.seller.draftQueue.length;
   }
 
   function clearPreviewObjectUrls() {
