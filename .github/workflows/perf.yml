@@ -1,0 +1,47 @@
+name: Performance checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  perf-guardrails:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Check bundle budgets
+        run: npm run check:bundle
+
+      - name: Check API payload contract
+        if: ${{ secrets.API_CONTRACT_BASE_URL != '' }}
+        env:
+          API_CONTRACT_BASE_URL: ${{ secrets.API_CONTRACT_BASE_URL }}
+        run: npm run check:api-contract
+
+      - name: Start preview server
+        run: npm run preview -- --host 127.0.0.1 --port 4173 &
+
+      - name: Wait for preview server
+        run: npx wait-on http://127.0.0.1:4173
+
+      - name: Run Lighthouse CI
+        run: npx lhci autorun --config=./lighthouserc.json

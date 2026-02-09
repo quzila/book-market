@@ -1,0 +1,21 @@
+{
+  "name": "dorm-market",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check:bundle": "node ./scripts/check-bundle-budget.mjs",
+    "check:api-contract": "node ./scripts/check-api-payload-contract.mjs",
+    "check:perf": "npm run build && npm run check:bundle && npm run check:api-contract"
+  },
+  "devDependencies": {
+    "@lhci/cli": "^0.15.1",
+    "vite": "^5.4.11",
+    "wait-on": "^7.2.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

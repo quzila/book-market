@@ -42,9 +42,11 @@ var LEGACY_INTEREST_HEADERS = ["created_at", "interest_id", "book_id", "jan", "v
 var DEFAULT_STATUS = "AVAILABLE";
 var UPLOAD_FOLDER_ID = "";
 var MARKET_SNAPSHOT_CACHE_KEY = "market_snapshot_v2";
-var MARKET_SNAPSHOT_TTL_SEC = 30;
+var MARKET_SNAPSHOT_TTL_SEC = 60;
 var SCHEMA_CACHE_KEY = "market_schema_ok_v2";
 var SCHEMA_CACHE_TTL_SEC = 3600;
+var MARKET_COMPUTE_VERSION_PROPERTY = "market_compute_version_v1";
+var MARKET_COMPUTE_CACHE_TTL_SEC = 60;
 
 var RESIDENTS_BY_ROOM = {
   "105": "坪田　晴琉",
@@ -116,6 +118,15 @@ function handleRequest_(method, e) {
         break;
       case "listListings":
         result = listListings_(req.payload, req.params);
+        break;
+      case "listListingsV2":
+        result = listListingsV2_(req.payload, req.params);
+        break;
+      case "getListingDetailV2":
+        result = getListingDetailV2_(req.payload, req.params);
+        break;
+      case "listWishersV2":
+        result = listWishersV2_(req.payload, req.params);
         break;
       case "uploadImage":
         result = uploadImage_(req.payload);
@@ -262,6 +273,41 @@ function readMarketplaceSnapshot_() {
 
 function invalidateMarketplaceCache_() {
   removeFromCache_(MARKET_SNAPSHOT_CACHE_KEY);
+  bumpMarketComputeVersion_();
+}
+
+function readMarketComputeVersion_() {
+  try {
+    var properties = PropertiesService.getScriptProperties();
+    var value = toText_(properties.getProperty(MARKET_COMPUTE_VERSION_PROPERTY));
+    if (value) {
+      return value;
+    }
+    value = String(new Date().getTime());
+    properties.setProperty(MARKET_COMPUTE_VERSION_PROPERTY, value);
+    return value;
+  } catch (error) {
+    return "0";
+  }
+}
+
+function bumpMarketComputeVersion_() {
+  try {
+    var properties = PropertiesService.getScriptProperties();
+    properties.setProperty(MARKET_COMPUTE_VERSION_PROPERTY, String(new Date().getTime()));
+  } catch (error) {
+    // ignore properties failures
+  }
+}
+
+function readComputedCache_(prefix, suffix) {
+  var version = readMarketComputeVersion_();
+  return readFromCache_(prefix + ":" + version + ":" + suffix);
+}
+
+function writeComputedCache_(prefix, suffix, value, ttlSec) {
+  var version = readMarketComputeVersion_();
+  writeToCache_(prefix + ":" + version + ":" + suffix, value, ttlSec);
 }
 
 function readFromCache_(key) {
@@ -511,6 +557,164 @@ function listListings_(payload, params) {
     ok: true,
     listings: filtered,
   };
+}
+
+function listListingsV2_(payload, params) {
+  var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
+  var limit = parsePositiveInt_((payload && payload.limit) || (params && params.limit), 80, 1, 200);
+  var cursor = parsePositiveInt_((payload && payload.cursor) || (params && params.cursor), 0, 0, 1000000);
+
+  var cacheSuffix = [viewerId || "_", String(limit), String(cursor)].join("|");
+  var cached = readComputedCache_("listings_v2", cacheSuffix);
+  if (cached) {
+    try {
+      var parsed = JSON.parse(cached);
+      if (parsed && parsed.ok && Array.isArray(parsed.listings)) {
+        return parsed;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
+  var groupedInterests = buildGroupedInterests_(interests);
+
+  var availableRows = [];
+  for (var i = 0; i < listings.length; i += 1) {
+    var row = listings[i];
+    var status = toText_(row.status) || DEFAULT_STATUS;
+    if (status !== DEFAULT_STATUS) {
+      continue;
+    }
+    availableRows.push(row);
+  }
+
+  availableRows.sort(function (a, b) {
+    var av = toText_(a.created_at);
+    var bv = toText_(b.created_at);
+    if (av < bv) return 1;
+    if (av > bv) return -1;
+    return 0;
+  });
+
+  var start = Math.min(cursor, availableRows.length);
+  var end = Math.min(start + limit, availableRows.length);
+  var page = [];
+
+  for (var j = start; j < end; j += 1) {
+    var pageRow = availableRows[j];
+    var listingId = toText_(pageRow.listing_id);
+    var interestMap = groupedInterests[listingId] || {};
+    page.push(mapListingRowToSummaryResponse_(pageRow, interestMap, viewerId));
+  }
+
+  var response = {
+    ok: true,
+    listings: page,
+    nextCursor: end < availableRows.length ? String(end) : "",
+    totalCount: availableRows.length,
+  };
+
+  writeComputedCache_("listings_v2", cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+  return response;
+}
+
+function getListingDetailV2_(payload, params) {
+  var listingId = toText_((payload && payload.listingId) || (params && params.listingId));
+  var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
+  assert_(listingId, "listingId is required");
+
+  var cacheSuffix = [listingId, viewerId || "_"].join("|");
+  var cached = readComputedCache_("detail_v2", cacheSuffix);
+  if (cached) {
+    try {
+      var parsed = JSON.parse(cached);
+      if (parsed && parsed.ok && parsed.listing) {
+        return parsed;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
+  var target = null;
+
+  for (var i = 0; i < listings.length; i += 1) {
+    if (toText_(listings[i].listing_id) !== listingId) {
+      continue;
+    }
+    var status = toText_(listings[i].status) || DEFAULT_STATUS;
+    if (status !== DEFAULT_STATUS) {
+      throw new Error("listing not available");
+    }
+    target = listings[i];
+    break;
+  }
+  assert_(target, "listing not found");
+
+  var groupedInterests = buildGroupedInterests_(interests);
+  var interestMap = groupedInterests[listingId] || {};
+  var listing = mapListingRowToDetailResponse_(target, interestMap, viewerId);
+
+  var response = {
+    ok: true,
+    listing: listing,
+  };
+  writeComputedCache_("detail_v2", cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+  return response;
+}
+
+function listWishersV2_(payload, params) {
+  var listingId = toText_((payload && payload.listingId) || (params && params.listingId));
+  var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
+  assert_(listingId, "listingId is required");
+
+  var cacheSuffix = [listingId, viewerId ? "login" : "guest"].join("|");
+  var cached = readComputedCache_("wishers_v2", cacheSuffix);
+  if (cached) {
+    try {
+      var parsed = JSON.parse(cached);
+      if (parsed && parsed.ok && parsed.listingId === listingId) {
+        return parsed;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
+
+  var exists = false;
+  for (var i = 0; i < listings.length; i += 1) {
+    if (toText_(listings[i].listing_id) !== listingId) {
+      continue;
+    }
+    var status = toText_(listings[i].status) || DEFAULT_STATUS;
+    if (status === DEFAULT_STATUS) {
+      exists = true;
+    }
+    break;
+  }
+  assert_(exists, "listing not found");
+
+  var groupedInterests = buildGroupedInterests_(interests);
+  var wishers = objectValues_(groupedInterests[listingId] || {});
+  var response = {
+    ok: true,
+    listingId: listingId,
+    wantedCount: wishers.length,
+    wantedBy: viewerId ? wishers : [],
+  };
+  writeComputedCache_("wishers_v2", cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+  return response;
 }
 
 function addListing_(payload) {
@@ -765,13 +969,31 @@ function parseDataUrl_(dataUrl, fallbackMimeType) {
   return null;
 }
 
-function buildDriveImageUrl_(fileId) {
-  return "https://drive.google.com/thumbnail?id=" + encodeURIComponent(fileId) + "&sz=w1600";
+function buildDriveImageUrl_(fileId, edgeSize) {
+  var size = parsePositiveInt_(edgeSize, 1200, 120, 2000);
+  return "https://drive.google.com/thumbnail?id=" + encodeURIComponent(fileId) + "&sz=w" + size;
 }
 
 function buildListingResponses_(listingRows, interests, viewerId) {
-  var groupedInterests = {};
+  var groupedInterests = buildGroupedInterests_(interests);
+  var responses = [];
 
+  for (var j = 0; j < listingRows.length; j += 1) {
+    var listingRow = listingRows[j];
+    var status = toText_(listingRow.status) || DEFAULT_STATUS;
+    if (status !== DEFAULT_STATUS) {
+      continue;
+    }
+
+    var map = groupedInterests[toText_(listingRow.listing_id)] || {};
+    responses.push(mapListingRowToResponse_(listingRow, map, viewerId));
+  }
+
+  return responses;
+}
+
+function buildGroupedInterests_(interests) {
+  var groupedInterests = {};
   for (var i = 0; i < interests.length; i += 1) {
     var interest = interests[i];
     var listingId = toText_(interest.listing_id);
@@ -789,20 +1011,55 @@ function buildListingResponses_(listingRows, interests, viewerId) {
       viewerName: toText_(interest.viewer_name),
     };
   }
+  return groupedInterests;
+}
 
-  var responses = [];
-  for (var j = 0; j < listingRows.length; j += 1) {
-    var listingRow = listingRows[j];
-    var status = toText_(listingRow.status) || DEFAULT_STATUS;
-    if (status !== DEFAULT_STATUS) {
-      continue;
-    }
-
-    var map = groupedInterests[toText_(listingRow.listing_id)] || {};
-    responses.push(mapListingRowToResponse_(listingRow, map, viewerId));
+function resolveListingImageVariants_(row) {
+  var imageUrls = parseJsonArray_(row.image_urls_json);
+  var firstImageUrl = imageUrls.length ? normalizeImageUrl_(imageUrls[0]) : "";
+  var driveId = extractDriveFileId_(firstImageUrl);
+  if (driveId) {
+    return {
+      thumbUrl: buildDriveImageUrl_(driveId, 480),
+      detailImageUrl: buildDriveImageUrl_(driveId, 1200),
+    };
   }
+  return {
+    thumbUrl: firstImageUrl,
+    detailImageUrl: firstImageUrl,
+  };
+}
 
-  return responses;
+function mapListingRowToSummaryResponse_(row, interestMap, viewerId) {
+  var listingId = toText_(row.listing_id);
+  var subjectTags = parseJsonArray_(row.subject_tags_json);
+  var variants = resolveListingImageVariants_(row);
+  var wantedCount = objectKeys_(interestMap).length;
+
+  return {
+    createdAt: toText_(row.created_at),
+    listingId: listingId,
+    itemType: normalizeItemType_(row.item_type),
+    category: toText_(row.category),
+    title: toText_(row.title),
+    thumbUrl: variants.thumbUrl,
+    detailImageUrl: variants.detailImageUrl,
+    jan: normalizeJan_(row.jan),
+    subjectTags: subjectTags,
+    author: toText_(row.author),
+    publisher: toText_(row.publisher),
+    sellerName: toText_(row.seller_name),
+    sellerId: toText_(row.seller_id),
+    status: toText_(row.status) || DEFAULT_STATUS,
+    wantedCount: wantedCount,
+    alreadyWanted: Boolean(viewerId && interestMap && interestMap[viewerId]),
+  };
+}
+
+function mapListingRowToDetailResponse_(row, interestMap, viewerId) {
+  var detail = mapListingRowToResponse_(row, interestMap, viewerId);
+  delete detail.wantedBy;
+  return detail;
 }
 
 function matchListingFilter_(listing, category, subject, q) {
@@ -852,6 +1109,7 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
   var wantedBy = objectValues_(interestMap);
   var listingId = toText_(row.listing_id);
   var subjectTags = parseJsonArray_(row.subject_tags_json);
+  var variants = resolveListingImageVariants_(row);
 
   return {
     createdAt: toText_(row.created_at),
@@ -861,6 +1119,8 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
     title: toText_(row.title),
     description: toText_(row.description),
     imageUrls: parseJsonArray_(row.image_urls_json),
+    thumbUrl: variants.thumbUrl,
+    detailImageUrl: variants.detailImageUrl,
     jan: normalizeJan_(row.jan),
     subjectTags: subjectTags,
     author: toText_(row.author),
@@ -996,7 +1256,7 @@ function normalizeImageUrl_(value) {
   text = text.replace(/^http:\/\//i, "https://");
   var driveFileId = extractDriveFileId_(text);
   if (driveFileId) {
-    return buildDriveImageUrl_(driveFileId);
+    return buildDriveImageUrl_(driveFileId, 1200);
   }
   return text;
 }
@@ -1101,6 +1361,24 @@ function normalizeQuery_(value) {
   return toText_(value).toLowerCase();
 }
 
+function parsePositiveInt_(value, fallback, min, max) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return fallback;
+  }
+  var parsed = Number(value);
+  if (!isFinite(parsed)) {
+    return fallback;
+  }
+  var intValue = Math.floor(parsed);
+  if (intValue < min) {
+    return min;
+  }
+  if (intValue > max) {
+    return max;
+  }
+  return intValue;
+}
+
 function toText_(value) {
   if (value === undefined || value === null) {
     return "";
@@ -1115,6 +1393,10 @@ function objectValues_(obj) {
     values.push(obj[keys[i]]);
   }
   return values;
+}
+
+function objectKeys_(obj) {
+  return Object.keys(obj || {});
 }
 
 function createId_(prefix) {

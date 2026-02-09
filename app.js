@@ -1,3 +1,5 @@
+import "./config.js";
+
 (() => {
   "use strict";
 
@@ -8,7 +10,7 @@
   const STORAGE_KEYS = {
     session: "dorm-market-session-v2",
     activeTab: "dorm-market-active-tab-v2",
-    listingsCache: "dorm-market-listings-cache-v1",
+    listingsCache: "dorm-market-listings-cache-v2",
   };
 
   const SUBJECT_OPTIONS = [
@@ -41,6 +43,8 @@
   const BOOK_SUMMARY_FALLBACK = "概要は取得できませんでした。説明欄の追記をご利用ください。";
   const BOOK_MIN_SUMMARY_LENGTH = 24;
   const LISTINGS_CACHE_TTL_MS = 1000 * 60 * 8;
+  const LISTINGS_PAGE_SIZE = 80;
+  const LISTINGS_PAGE_MAX = 20;
   const MAX_UPLOAD_IMAGES = 5;
   const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024;
   const IMAGE_UPLOAD_CONCURRENCY = 3;
@@ -58,6 +62,9 @@
     pendingResident: null,
     detailListingId: "",
     listings: [],
+    detailCache: {},
+    subjectTagsRendered: false,
+    previewObjectUrls: [],
     myPage: {
       wanted: [],
       mine: [],
@@ -65,6 +72,8 @@
     requests: {
       listings: null,
       myPage: null,
+      detailByListingId: {},
+      wishersByListingId: {},
     },
     seller: {
       currentBookMeta: null,
@@ -159,10 +168,10 @@
 
   function initialize() {
     ensureRequiredDom();
-    renderSubjectTags();
     bindEvents();
     renderSessionState();
     switchTab(state.activeTab, { persist: false });
+    queueSubjectTagsRender();
     hydrateListingsFromCache();
     refreshListings();
   }
@@ -346,6 +355,10 @@
 
     applyAccessState();
 
+    if (target === "plus") {
+      ensureSubjectTagsRendered();
+    }
+
     if (target === "my") {
       refreshMyPage();
     }
@@ -514,6 +527,9 @@
 
   function handleLogout() {
     state.session = null;
+    state.detailCache = {};
+    state.requests.detailByListingId = {};
+    state.requests.wishersByListingId = {};
     clearSession();
     renderSessionState();
     renderMyPage([], [], []);
@@ -531,32 +547,21 @@
 
     state.requests.listings = (async () => {
       setStatus(dom.homeStatus, "一覧を読み込み中...");
-      const result = await apiGet("listListings", {
-        viewerId: state.session ? state.session.userId : "",
-      });
-
-      if (!result.ok) {
-        if (!state.listings.length) {
-          dom.listingGrid.innerHTML = "";
-          closeDetailModal();
-        }
-        setStatus(dom.homeStatus, result.error || "一覧の取得に失敗しました。", "error");
-        return;
-      }
-
-      const rawListings = Array.isArray(result.listings)
-        ? result.listings
-        : Array.isArray(result.books)
-          ? result.books
-          : [];
-
+      const rawListings = await fetchListingsSummary();
       state.listings = rawListings.map(normalizeListing).filter((item) => item.listingId);
+      syncDetailCacheFromSummaries(state.listings);
       writeListingsCache(rawListings);
       renderHome();
 
       if (state.activeTab === "my" && state.session) {
         await refreshMyPage();
       }
+    })().catch((error) => {
+      if (!state.listings.length) {
+        dom.listingGrid.innerHTML = "";
+        closeDetailModal();
+      }
+      setStatus(dom.homeStatus, String(error.message || error || "一覧の取得に失敗しました。"), "error");
     })();
 
     try {
@@ -564,6 +569,67 @@
     } finally {
       state.requests.listings = null;
     }
+  }
+
+  async function fetchListingsSummary() {
+    try {
+      return await fetchListingsSummaryV2();
+    } catch (error) {
+      console.warn("listListingsV2 failed; fallback to listListings", error);
+      const legacy = await apiGet("listListings", {
+        viewerId: state.session ? state.session.userId : "",
+      });
+      if (!legacy.ok) {
+        throw new Error(legacy.error || "一覧の取得に失敗しました。");
+      }
+      return Array.isArray(legacy.listings)
+        ? legacy.listings
+        : Array.isArray(legacy.books)
+          ? legacy.books
+          : [];
+    }
+  }
+
+  async function fetchListingsSummaryV2() {
+    const viewerId = state.session ? state.session.userId : "";
+    const all = [];
+    let cursor = "";
+    const seenCursors = new Set();
+
+    for (let i = 0; i < LISTINGS_PAGE_MAX; i += 1) {
+      const result = await apiGet("listListingsV2", {
+        viewerId,
+        limit: LISTINGS_PAGE_SIZE,
+        cursor,
+      });
+      if (!result.ok) {
+        throw new Error(result.error || "一覧の取得に失敗しました。");
+      }
+
+      const rows = Array.isArray(result.listings) ? result.listings : [];
+      if (rows.length) {
+        all.push(...rows);
+      }
+
+      const nextCursor = normalizeText(result.nextCursor);
+      if (!nextCursor || seenCursors.has(nextCursor)) {
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    return all;
+  }
+
+  function syncDetailCacheFromSummaries(summaries) {
+    summaries.forEach((summary) => {
+      const cached = state.detailCache[summary.listingId];
+      if (!cached) {
+        return;
+      }
+      state.detailCache[summary.listingId] = mergeListing(summary, cached);
+    });
   }
 
   function renderHome() {
@@ -592,6 +658,7 @@
   function filterListings(listings) {
     const category = state.filters.category;
     const queryTokens = parseSearchTokens(state.filters.q);
+    const usePhonetic = queryTokens.some((token) => token.phonetic);
 
     return listings.filter((listing) => {
       if (category && normalizeItemType(listing.itemType) !== category) {
@@ -600,7 +667,13 @@
 
       if (queryTokens.length) {
         const rawIndex = normalizeSearchText(listing.searchRaw || buildListingSearchText(listing));
-        const phoneticIndex = listing.searchPhonetic || toPhoneticSearchKey(rawIndex);
+        let phoneticIndex = "";
+        if (usePhonetic) {
+          if (!listing.searchPhonetic) {
+            listing.searchPhonetic = toPhoneticSearchKey(rawIndex);
+          }
+          phoneticIndex = listing.searchPhonetic;
+        }
 
         const matched = queryTokens.every((token) => {
           const rawMatch = token.raw ? rawIndex.includes(token.raw) : false;
@@ -629,7 +702,7 @@
     photo.className = "listing-photo";
     photo.alt = `${listing.title || "商品"} の画像`;
     photo.loading = "lazy";
-    setImageWithFallback(photo, imageCandidatesFromListing(listing));
+    setImageWithFallback(photo, imageCandidatesFromListing(listing, "card"));
 
     const title = document.createElement("h3");
     title.className = "listing-title";
@@ -704,13 +777,15 @@
   }
 
   function openDetailByListingId(listingId) {
-    const listing = findListingById(normalizeText(listingId));
+    const normalizedId = normalizeText(listingId);
+    const listing = findListingById(normalizedId);
     if (!listing) {
       return;
     }
     state.detailListingId = listing.listingId;
     renderDetailModal(listing);
     dom.detailModal.classList.remove("hidden");
+    loadListingDetail(normalizedId);
   }
 
   function closeDetailModal() {
@@ -751,10 +826,11 @@
     ]
       .filter(Boolean)
       .join(" / ");
-    dom.detailDescription.textContent = listing.description || listing.summary || "説明は未入力です。";
+    dom.detailDescription.textContent =
+      listing.description || listing.summary || "詳細情報を読み込み中です。";
 
     dom.detailImage.alt = `${listing.title || "商品"} の画像`;
-    setImageWithFallback(dom.detailImage, imageCandidatesFromListing(listing));
+    setImageWithFallback(dom.detailImage, imageCandidatesFromListing(listing, "detail"));
 
     dom.detailTags.innerHTML = "";
     appendTag(dom.detailTags, listing.itemTypeLabel || listingTypeLabel(listing.itemType));
@@ -773,6 +849,87 @@
     dom.detailWishersButton.textContent = `欲しい人 ${Number(listing.wantedCount || 0)}名`;
 
     setStatus(dom.detailStatus, "");
+  }
+
+  async function loadListingDetail(listingId, options = {}) {
+    const normalizedId = normalizeText(listingId);
+    if (!normalizedId) {
+      return null;
+    }
+
+    const forceRefresh = Boolean(options.forceRefresh);
+    if (!forceRefresh && state.detailCache[normalizedId]) {
+      return state.detailCache[normalizedId];
+    }
+    if (state.requests.detailByListingId[normalizedId]) {
+      return state.requests.detailByListingId[normalizedId];
+    }
+
+    state.requests.detailByListingId[normalizedId] = (async () => {
+      const result = await apiGet(
+        "getListingDetailV2",
+        {
+          listingId: normalizedId,
+          viewerId: state.session ? state.session.userId : "",
+        },
+        45000,
+        1
+      );
+      let detailRaw = result.ok && result.listing ? result.listing : null;
+
+      if (!detailRaw) {
+        const legacy = await fetchListingDetailLegacy(normalizedId);
+        detailRaw = legacy;
+      }
+      if (!detailRaw) {
+        throw new Error(result.error || "詳細の取得に失敗しました。");
+      }
+
+      const detail = normalizeListing(detailRaw);
+      const merged = mergeListing(findListingById(normalizedId), detail);
+      state.detailCache[normalizedId] = merged;
+      return merged;
+    })();
+
+    try {
+      if (state.detailListingId === normalizedId) {
+        setStatus(dom.detailStatus, "詳細を読み込み中...");
+      }
+      const detail = await state.requests.detailByListingId[normalizedId];
+      if (state.detailListingId === normalizedId) {
+        renderDetailModal(detail);
+        setStatus(dom.detailStatus, "");
+      }
+      return detail;
+    } catch (error) {
+      if (state.detailListingId === normalizedId) {
+        setStatus(dom.detailStatus, String(error.message || error), "error");
+      }
+      return null;
+    } finally {
+      delete state.requests.detailByListingId[normalizedId];
+    }
+  }
+
+  async function fetchListingDetailLegacy(listingId) {
+    const legacy = await apiGet(
+      "listListings",
+      {
+        viewerId: state.session ? state.session.userId : "",
+      },
+      45000,
+      1
+    );
+    if (!legacy.ok) {
+      return null;
+    }
+    const rows = Array.isArray(legacy.listings)
+      ? legacy.listings
+      : Array.isArray(legacy.books)
+        ? legacy.books
+        : [];
+    const found = rows.find((item) => normalizeText(item.listingId || item.listing_id || item.bookId || item.book_id) === listingId);
+    return found || null;
   }
 
   async function handleListingActionClick(event) {
@@ -800,23 +957,27 @@
     }
 
     if (action === "show-wishers") {
-      openWishersModal(listing);
+      await openWishersModal(listing);
     }
   }
 
   function findListingById(listingId) {
+    const fromCache = state.detailCache[listingId] || null;
     const inMain = state.listings.find((item) => item.listingId === listingId);
     if (inMain) {
-      return inMain;
+      return mergeListing(inMain, fromCache);
     }
 
     const inWanted = state.myPage.wanted.find((item) => item.listingId === listingId);
     if (inWanted) {
-      return inWanted;
+      return mergeListing(inWanted, fromCache);
     }
 
     const inMine = state.myPage.mine.find((item) => item.listingId === listingId);
-    return inMine || null;
+    if (inMine) {
+      return mergeListing(inMine, fromCache);
+    }
+    return fromCache;
   }
 
   async function toggleWant(listing) {
@@ -854,6 +1015,7 @@
 
     await refreshListings();
     if (state.detailListingId === listing.listingId) {
+      await loadListingDetail(listing.listingId, { forceRefresh: true });
       setStatus(dom.detailStatus, "更新しました。", "ok");
     }
   }
@@ -875,16 +1037,26 @@
     }
 
     await refreshListings();
+    await loadListingDetail(listing.listingId, { forceRefresh: true });
   }
 
-  function openWishersModal(listing) {
+  async function openWishersModal(listing) {
     dom.wishersTitle.textContent = listing.title || "商品";
     dom.wishersList.innerHTML = "";
+    setStatus(dom.wishersStatus, "希望者データを読み込み中...");
+    dom.wishersModal.classList.remove("hidden");
 
-    const users = Array.isArray(listing.wantedBy) ? listing.wantedBy : [];
+    const wished = await fetchWishersByListingId(listing.listingId, listing);
+    const users = Array.isArray(wished?.wantedBy)
+      ? wished.wantedBy
+      : Array.isArray(listing.wantedBy)
+        ? listing.wantedBy
+        : [];
+    const wantedCount = Number(wished?.wantedCount ?? listing.wantedCount ?? users.length ?? 0);
+
     if (!users.length) {
       const li = document.createElement("li");
-      li.textContent = "まだ希望者はいません。";
+      li.textContent = wantedCount > 0 ? `希望者は ${wantedCount}名です。` : "まだ希望者はいません。";
       dom.wishersList.appendChild(li);
       setStatus(dom.wishersStatus, "");
     } else if (!state.session) {
@@ -900,8 +1072,68 @@
       });
       setStatus(dom.wishersStatus, `${users.length}名が希望しています。`, "ok");
     }
+  }
 
-    dom.wishersModal.classList.remove("hidden");
+  async function fetchWishersByListingId(listingId, listing) {
+    const normalizedId = normalizeText(listingId);
+    if (!normalizedId) {
+      return null;
+    }
+    if (state.requests.wishersByListingId[normalizedId]) {
+      return state.requests.wishersByListingId[normalizedId];
+    }
+
+    state.requests.wishersByListingId[normalizedId] = (async () => {
+      const result = await apiGet(
+        "listWishersV2",
+        {
+          listingId: normalizedId,
+          viewerId: state.session ? state.session.userId : "",
+        },
+        45000,
+        1
+      );
+      let wishedPayload = result.ok
+        ? {
+            wantedBy: result.wantedBy,
+            wantedCount: result.wantedCount,
+          }
+        : null;
+
+      if (!wishedPayload) {
+        const legacy = await fetchListingDetailLegacy(normalizedId);
+        if (legacy) {
+          wishedPayload = {
+            wantedBy: legacy.wantedBy || legacy.wanted_by || [],
+            wantedCount: legacy.wantedCount || legacy.wanted_count || 0,
+          };
+        }
+      }
+      if (!wishedPayload) {
+        throw new Error(result.error || "希望者の取得に失敗しました。");
+      }
+      const wantedBy = parseArray(wishedPayload.wantedBy).map((item) => ({
+        viewerId: normalizeText(item.viewerId || item.viewer_id),
+        viewerName: normalizeText(item.viewerName || item.viewer_name || item.name),
+      }));
+      const wantedCount = Number(wishedPayload.wantedCount || wantedBy.length || 0);
+      const merged = mergeListing(listing, {
+        listingId: normalizedId,
+        wantedBy,
+        wantedCount,
+      });
+      state.detailCache[normalizedId] = mergeListing(state.detailCache[normalizedId], merged);
+      return merged;
+    })();
+
+    try {
+      return await state.requests.wishersByListingId[normalizedId];
+    } catch (error) {
+      setStatus(dom.wishersStatus, String(error.message || error), "error");
+      return null;
+    } finally {
+      delete state.requests.wishersByListingId[normalizedId];
+    }
   }
 
   function closeWishersModal() {
@@ -911,7 +1143,28 @@
     setStatus(dom.wishersStatus, "");
   }
 
+  function queueSubjectTagsRender() {
+    if (state.subjectTagsRendered) {
+      return;
+    }
+    const render = () => ensureSubjectTagsRendered();
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(render, { timeout: 1200 });
+      return;
+    }
+    window.setTimeout(render, 600);
+  }
+
+  function ensureSubjectTagsRendered() {
+    if (state.subjectTagsRendered) {
+      return;
+    }
+    state.subjectTagsRendered = true;
+    renderSubjectTags();
+  }
+
   function syncBookFieldVisibility() {
+    ensureSubjectTagsRendered();
     const isBook = dom.itemTypeInput.value === "book";
     dom.bookFields.classList.toggle("hidden", !isBook);
     if (!isBook) {
@@ -991,6 +1244,7 @@
   }
 
   function handleImagePreview() {
+    clearPreviewObjectUrls();
     dom.imagePreview.innerHTML = "";
     const files = Array.from(dom.imageInput.files || []);
 
@@ -1003,11 +1257,9 @@
     files.forEach((file) => {
       const img = document.createElement("img");
       img.alt = file.name;
-      const reader = new FileReader();
-      reader.onload = () => {
-        img.src = String(reader.result || NO_IMAGE);
-      };
-      reader.readAsDataURL(file);
+      const objectUrl = URL.createObjectURL(file);
+      state.previewObjectUrls.push(objectUrl);
+      img.src = objectUrl;
       dom.imagePreview.appendChild(img);
     });
 
@@ -1110,6 +1362,7 @@
       }
 
       dom.listingForm.reset();
+      clearPreviewObjectUrls();
       dom.imagePreview.innerHTML = "";
       state.seller.currentBookMeta = null;
       state.seller.currentJan = "";
@@ -1126,7 +1379,19 @@
     }
   }
 
+  function clearPreviewObjectUrls() {
+    state.previewObjectUrls.forEach((url) => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore revoke failures
+      }
+    });
+    state.previewObjectUrls = [];
+  }
+
   function collectSubjectTags() {
+    ensureSubjectTagsRendered();
     const checked = Array.from(dom.subjectTags.querySelectorAll("input[type='checkbox']:checked")).map((input) =>
       normalizeText(input.value)
     );
@@ -1377,6 +1642,9 @@
     }));
 
     const wantedCount = Number(raw?.wantedCount || raw?.wanted_count || wantedBy.length || 0);
+    const imageUrls = parseArray(raw?.imageUrls || raw?.image_urls || raw?.image_urls_json).map(normalizeUrl).filter(Boolean);
+    const thumbUrl = normalizeUrl(raw?.thumbUrl || raw?.thumb_url);
+    const detailImageUrl = normalizeUrl(raw?.detailImageUrl || raw?.detail_image_url || raw?.coverUrl || raw?.cover_url);
 
     const listing = {
       listingId,
@@ -1386,8 +1654,10 @@
       title: normalizeText(raw?.title),
       description: normalizeText(raw?.description),
       summary: normalizeText(raw?.summary),
-      imageUrls: parseArray(raw?.imageUrls || raw?.image_urls || raw?.image_urls_json).map(normalizeUrl).filter(Boolean),
-      coverUrl: normalizeUrl(raw?.coverUrl || raw?.cover_url),
+      imageUrls,
+      thumbUrl,
+      detailImageUrl,
+      coverUrl: detailImageUrl,
       jan: normalizeJan(raw?.jan),
       subjectTags: parseArray(raw?.subjectTags || raw?.subject_tags || raw?.subject_tags_json).map(normalizeText),
       author: normalizeText(raw?.author),
@@ -1403,8 +1673,60 @@
     };
 
     listing.searchRaw = buildListingSearchText(listing);
-    listing.searchPhonetic = toPhoneticSearchKey(listing.searchRaw);
+    listing.searchPhonetic = "";
     return listing;
+  }
+
+  function mergeListing(base, patch) {
+    const left = base && typeof base === "object" ? base : {};
+    const right = patch && typeof patch === "object" ? patch : {};
+    const merged = {
+      ...left,
+      ...right,
+      itemType: normalizeItemType(right.itemType || left.itemType || "other"),
+    };
+
+    merged.listingId = normalizeText(right.listingId || left.listingId);
+    merged.itemTypeLabel = listingTypeLabel(merged.itemType);
+    merged.category = normalizeText(right.category || left.category);
+    merged.title = normalizeText(right.title || left.title);
+    merged.description = normalizeText(right.description || left.description);
+    merged.summary = normalizeText(right.summary || left.summary);
+    merged.imageUrls = Array.isArray(right.imageUrls)
+      ? right.imageUrls
+      : Array.isArray(left.imageUrls)
+        ? left.imageUrls
+        : [];
+    merged.thumbUrl = normalizeUrl(right.thumbUrl || left.thumbUrl);
+    merged.detailImageUrl = normalizeUrl(right.detailImageUrl || left.detailImageUrl || right.coverUrl || left.coverUrl);
+    merged.coverUrl = normalizeUrl(merged.detailImageUrl || right.coverUrl || left.coverUrl);
+    merged.jan = normalizeJan(right.jan || left.jan);
+    merged.subjectTags = Array.isArray(right.subjectTags)
+      ? right.subjectTags
+      : Array.isArray(left.subjectTags)
+        ? left.subjectTags
+        : [];
+    merged.author = normalizeText(right.author || left.author);
+    merged.publisher = normalizeText(right.publisher || left.publisher);
+    merged.publishedDate = normalizeText(right.publishedDate || left.publishedDate);
+    merged.sellerName = normalizeText(right.sellerName || left.sellerName);
+    merged.sellerId = normalizeText(right.sellerId || left.sellerId);
+    merged.status = normalizeText(right.status || left.status || "AVAILABLE");
+    merged.createdAt = normalizeText(right.createdAt || left.createdAt);
+    merged.wantedCount = Number(
+      right.wantedCount !== undefined ? right.wantedCount : left.wantedCount !== undefined ? left.wantedCount : 0
+    );
+    merged.wantedBy = Array.isArray(right.wantedBy)
+      ? right.wantedBy
+      : Array.isArray(left.wantedBy)
+        ? left.wantedBy
+        : [];
+    merged.alreadyWanted =
+      right.alreadyWanted !== undefined ? Boolean(right.alreadyWanted) : Boolean(left.alreadyWanted);
+
+    merged.searchRaw = buildListingSearchText(merged);
+    merged.searchPhonetic = normalizeText(left.searchPhonetic || right.searchPhonetic);
+    return merged;
   }
 
   function parseArray(value) {
@@ -1502,7 +1824,7 @@
     );
     return rawTokens.map((raw) => ({
       raw,
-      phonetic: toPhoneticSearchKey(raw),
+      phonetic: /[ぁ-んァ-ヶーｰ〜～]/.test(raw) ? toPhoneticSearchKey(raw) : "",
     }));
   }
 
@@ -1510,15 +1832,18 @@
     return normalizeText(text).replace(/[ァ-ヶ]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0x60));
   }
 
-  function imageCandidatesFromListing(listing) {
+  function imageCandidatesFromListing(listing, profile = "card") {
+    const targetSize = profile === "detail" ? 1200 : 480;
+    const fallbackSize = profile === "detail" ? 800 : 320;
     const originals = uniqueStrings([
+      normalizeUrl(profile === "detail" ? listing.detailImageUrl : listing.thumbUrl),
       ...(Array.isArray(listing.imageUrls) ? listing.imageUrls : []),
       normalizeUrl(listing.coverUrl),
     ]);
 
     const expanded = [];
     originals.forEach((url) => {
-      expandImageUrlCandidates(url).forEach((candidate) => {
+      expandImageUrlCandidates(url, targetSize, fallbackSize).forEach((candidate) => {
         if (!candidate || expanded.includes(candidate)) {
           return;
         }
@@ -1528,7 +1853,7 @@
     return expanded.length ? expanded : [NO_IMAGE];
   }
 
-  function expandImageUrlCandidates(url) {
+  function expandImageUrlCandidates(url, targetSize, fallbackSize) {
     const normalized = normalizeUrl(url);
     if (!normalized) {
       return [];
@@ -1541,8 +1866,9 @@
 
     const encodedId = encodeURIComponent(driveId);
     return uniqueStrings([
-      `https://lh3.googleusercontent.com/d/${encodedId}=w1600`,
-      `https://drive.google.com/thumbnail?id=${encodedId}&sz=w1600`,
+      `https://lh3.googleusercontent.com/d/${encodedId}=w${targetSize}`,
+      `https://drive.google.com/thumbnail?id=${encodedId}&sz=w${targetSize}`,
+      `https://drive.google.com/thumbnail?id=${encodedId}&sz=w${fallbackSize}`,
       `https://drive.google.com/uc?export=view&id=${encodedId}`,
       normalized,
     ]);

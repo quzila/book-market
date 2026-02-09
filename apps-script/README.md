@@ -41,6 +41,17 @@ request:
 
 ### GET `action=listListings&viewerId=...&category=...&subject=...&q=...`
 
+### GET `action=listListingsV2&viewerId=...&limit=80&cursor=0`
+- 初回ロード向けの軽量一覧API（`wantedBy` を含まない）。
+- `nextCursor` が空文字の場合、次ページなし。
+
+### GET `action=getListingDetailV2&listingId=...&viewerId=...`
+- 商品詳細を遅延取得するAPI。
+
+### GET `action=listWishersV2&listingId=...&viewerId=...`
+- 希望者一覧を遅延取得するAPI。
+- 未ログイン (`viewerId` なし) の場合は `wantedBy` は空配列、`wantedCount` のみ返す。
+
 ### POST `action=uploadImage`
 request:
 ```json
