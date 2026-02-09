@@ -47,6 +47,8 @@ var SCHEMA_CACHE_KEY = "market_schema_ok_v2";
 var SCHEMA_CACHE_TTL_SEC = 3600;
 var MARKET_COMPUTE_VERSION_PROPERTY = "market_compute_version_v1";
 var MARKET_COMPUTE_CACHE_TTL_SEC = 60;
+var LISTINGS_SUMMARY_SNAPSHOT_CACHE_KEY = "listings_summary_snapshot_v1";
+var LISTINGS_SUMMARY_SNAPSHOT_CACHE_TTL_SEC = 120;
 
 var RESIDENTS_BY_ROOM = {
   "105": "坪田　晴琉",
@@ -121,6 +123,9 @@ function handleRequest_(method, e) {
         break;
       case "listListingsV2":
         result = listListingsV2_(req.payload, req.params);
+        break;
+      case "getListingsVersion":
+        result = getListingsVersion_(req.payload, req.params);
         break;
       case "getListingDetailV2":
         result = getListingDetailV2_(req.payload, req.params);
@@ -575,7 +580,53 @@ function listListingsV2_(payload, params) {
   if (cached) {
     try {
       var parsed = JSON.parse(cached);
-      if (parsed && parsed.ok && Array.isArray(parsed.listings)) {
+      if (parsed && parsed.ok && Array.isArray(parsed.listings) && toText_(parsed.version)) {
+        return parsed;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  var summarySnapshot = readListingsSummarySnapshot_();
+  var summaries = Array.isArray(summarySnapshot.listings) ? summarySnapshot.listings : [];
+  var start = Math.min(cursor, summaries.length);
+  var end = Math.min(start + limit, summaries.length);
+  var page = [];
+
+  for (var i = start; i < end; i += 1) {
+    page.push(mapSummarySnapshotForViewer_(summaries[i], viewerId));
+  }
+
+  var response = {
+    ok: true,
+    version: toText_(summarySnapshot.version) || readMarketComputeVersion_(),
+    listings: page,
+    nextCursor: end < summaries.length ? String(end) : "",
+    totalCount: summaries.length,
+  };
+
+  writeComputedCache_("listings_v2", cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+  return response;
+}
+
+function getListingsVersion_(payload, params) {
+  var summarySnapshot = readListingsSummarySnapshot_();
+  var totalCount = Array.isArray(summarySnapshot.listings) ? summarySnapshot.listings.length : 0;
+  return {
+    ok: true,
+    version: toText_(summarySnapshot.version) || readMarketComputeVersion_(),
+    totalCount: totalCount,
+    generatedAt: toText_(summarySnapshot.generatedAt),
+  };
+}
+
+function readListingsSummarySnapshot_() {
+  var cached = readComputedCache_(LISTINGS_SUMMARY_SNAPSHOT_CACHE_KEY, "all");
+  if (cached) {
+    try {
+      var parsed = JSON.parse(cached);
+      if (parsed && parsed.ok && Array.isArray(parsed.listings) && toText_(parsed.version)) {
         return parsed;
       }
     } catch (error) {
@@ -587,8 +638,8 @@ function listListingsV2_(payload, params) {
   var listings = snapshot.listings || [];
   var interests = snapshot.interests || [];
   var groupedInterests = buildGroupedInterests_(interests);
-
   var availableRows = [];
+
   for (var i = 0; i < listings.length; i += 1) {
     var row = listings[i];
     var status = toText_(row.status) || DEFAULT_STATUS;
@@ -606,26 +657,60 @@ function listListingsV2_(payload, params) {
     return 0;
   });
 
-  var start = Math.min(cursor, availableRows.length);
-  var end = Math.min(start + limit, availableRows.length);
-  var page = [];
-
-  for (var j = start; j < end; j += 1) {
-    var pageRow = availableRows[j];
-    var listingId = toText_(pageRow.listing_id);
+  var summaries = [];
+  for (var j = 0; j < availableRows.length; j += 1) {
+    var summaryRow = availableRows[j];
+    var listingId = toText_(summaryRow.listing_id);
     var interestMap = groupedInterests[listingId] || {};
-    page.push(mapListingRowToSummaryResponse_(pageRow, interestMap, viewerId));
+    var summary = mapListingRowToSummaryResponse_(summaryRow, interestMap, "");
+    summary.wantedViewerIds = objectKeys_(interestMap);
+    delete summary.alreadyWanted;
+    summaries.push(summary);
   }
 
   var response = {
     ok: true,
-    listings: page,
-    nextCursor: end < availableRows.length ? String(end) : "",
-    totalCount: availableRows.length,
+    version: readMarketComputeVersion_(),
+    generatedAt: new Date().toISOString(),
+    listings: summaries,
   };
 
-  writeComputedCache_("listings_v2", cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+  writeComputedCache_(
+    LISTINGS_SUMMARY_SNAPSHOT_CACHE_KEY,
+    "all",
+    JSON.stringify(response),
+    LISTINGS_SUMMARY_SNAPSHOT_CACHE_TTL_SEC
+  );
   return response;
+}
+
+function mapSummarySnapshotForViewer_(summaryRow, viewerId) {
+  var row = summaryRow || {};
+  var wantedViewerIds = Array.isArray(row.wantedViewerIds) ? row.wantedViewerIds : [];
+  var wantedCount = parsePositiveInt_(row.wantedCount, 0, 0, 1000000);
+  var alreadyWanted = false;
+  if (viewerId) {
+    alreadyWanted = wantedViewerIds.indexOf(viewerId) !== -1;
+  }
+
+  return {
+    createdAt: toText_(row.createdAt),
+    listingId: toText_(row.listingId),
+    itemType: normalizeItemType_(row.itemType),
+    category: toText_(row.category),
+    title: toText_(row.title),
+    thumbUrl: normalizeImageUrl_(row.thumbUrl),
+    detailImageUrl: normalizeImageUrl_(row.detailImageUrl),
+    jan: normalizeJan_(row.jan),
+    subjectTags: sanitizeTextArray_(row.subjectTags, 50),
+    author: toText_(row.author),
+    publisher: toText_(row.publisher),
+    sellerName: toText_(row.sellerName),
+    sellerId: toText_(row.sellerId),
+    status: toText_(row.status) || DEFAULT_STATUS,
+    wantedCount: wantedCount,
+    alreadyWanted: alreadyWanted,
+  };
 }
 
 function getListingDetailV2_(payload, params) {

@@ -43,7 +43,13 @@ request:
 
 ### GET `action=listListingsV2&viewerId=...&limit=80&cursor=0`
 - 初回ロード向けの軽量一覧API（`wantedBy` を含まない）。
+- サーバー側の一覧スナップショット JSON からページ単位で返す。
+- レスポンスに `version` を含む（クライアント側のキャッシュ判定用）。
 - `nextCursor` が空文字の場合、次ページなし。
+
+### GET `action=getListingsVersion`
+- 一覧スナップショットの `version` と `totalCount` を返す軽量API。
+- クライアントは `version` が同じ場合に一覧再取得をスキップできる。
 
 ### GET `action=getListingDetailV2&listingId=...&viewerId=...`
 - 商品詳細を遅延取得するAPI。

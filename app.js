@@ -10,7 +10,7 @@ import "./config.js";
   const STORAGE_KEYS = {
     session: "dorm-market-session-v2",
     activeTab: "dorm-market-active-tab-v2",
-    listingsCache: "dorm-market-listings-cache-v2",
+    listingsCache: "dorm-market-listings-cache-v3",
   };
 
   const SUBJECT_OPTIONS = [
@@ -43,6 +43,7 @@ import "./config.js";
   const BOOK_SUMMARY_FALLBACK = "概要は取得できませんでした。説明欄の追記をご利用ください。";
   const BOOK_MIN_SUMMARY_LENGTH = 24;
   const LISTINGS_CACHE_TTL_MS = 1000 * 60 * 8;
+  const LISTINGS_VERSION_TIMEOUT_MS = 12000;
   const LISTINGS_PAGE_SIZE = 80;
   const LISTINGS_PAGE_MAX = 20;
   const MAX_UPLOAD_IMAGES = 5;
@@ -63,6 +64,8 @@ import "./config.js";
     pendingResident: null,
     detailListingId: "",
     listings: [],
+    listingsVersion: "",
+    listingsViewerId: "",
     detailCache: {},
     subjectTagsRendered: false,
     previewObjectUrls: [],
@@ -427,10 +430,12 @@ import "./config.js";
 
   function hydrateListingsFromCache() {
     const cached = loadListingsCache();
-    if (!cached.length) {
+    if (!cached.listings.length || cached.viewerId !== currentViewerId()) {
       return;
     }
-    state.listings = cached;
+    state.listings = cached.listings;
+    state.listingsVersion = cached.version;
+    state.listingsViewerId = cached.viewerId;
     renderHome();
     setStatus(dom.homeStatus, "前回データを表示中...");
   }
@@ -439,27 +444,47 @@ import "./config.js";
     try {
       const raw = window.localStorage.getItem(STORAGE_KEYS.listingsCache);
       if (!raw) {
-        return [];
+        return {
+          listings: [],
+          version: "",
+          viewerId: "",
+        };
       }
       const parsed = JSON.parse(raw);
       const savedAt = Number(parsed?.savedAt || 0);
       const rows = Array.isArray(parsed?.listings) ? parsed.listings : [];
+      const version = normalizeText(parsed?.version);
+      const viewerId = normalizeText(parsed?.viewerId);
       if (!savedAt || Date.now() - savedAt > LISTINGS_CACHE_TTL_MS) {
         window.localStorage.removeItem(STORAGE_KEYS.listingsCache);
-        return [];
+        return {
+          listings: [],
+          version: "",
+          viewerId: "",
+        };
       }
-      return rows.map(normalizeListing).filter((item) => item.listingId);
+      return {
+        listings: rows.map(normalizeListing).filter((item) => item.listingId),
+        version,
+        viewerId,
+      };
     } catch {
-      return [];
+      return {
+        listings: [],
+        version: "",
+        viewerId: "",
+      };
     }
   }
 
-  function writeListingsCache(listings) {
+  function writeListingsCache(listings, version = "", viewerId = "") {
     try {
       window.localStorage.setItem(
         STORAGE_KEYS.listingsCache,
         JSON.stringify({
           savedAt: Date.now(),
+          version: normalizeText(version),
+          viewerId: normalizeText(viewerId),
           listings: Array.isArray(listings) ? listings : [],
         })
       );
@@ -560,11 +585,38 @@ import "./config.js";
     }
 
     state.requests.listings = (async () => {
-      setStatus(dom.homeStatus, "一覧を読み込み中...");
-      const rawListings = await fetchListingsSummary();
-      state.listings = rawListings.map(normalizeListing).filter((item) => item.listingId);
-      syncDetailCacheFromSummaries(state.listings);
-      writeListingsCache(rawListings);
+      const viewerId = currentViewerId();
+      setStatus(dom.homeStatus, state.listings.length ? "新しいデータを確認中..." : "一覧を読み込み中...");
+
+      const versionInfo = await fetchListingsVersionInfo();
+      const remoteVersion = normalizeText(versionInfo?.version);
+      const canReuseCached =
+        Boolean(remoteVersion) &&
+        Boolean(state.listings.length) &&
+        remoteVersion === state.listingsVersion &&
+        viewerId === state.listingsViewerId;
+
+      if (canReuseCached) {
+        renderHome();
+        if (state.activeTab === "my" && state.session) {
+          await refreshMyPage();
+        }
+        return;
+      }
+
+      let fetched;
+      try {
+        fetched = await fetchListingsSummaryV2Progressive(viewerId, remoteVersion);
+      } catch (error) {
+        console.warn("listListingsV2 failed; fallback to listListings", error);
+        fetched = await fetchListingsSummaryLegacy(viewerId, remoteVersion);
+      }
+
+      state.listings = fetched.listings;
+      state.listingsVersion = fetched.version;
+      state.listingsViewerId = viewerId;
+      syncDetailCacheFromSummaries(fetched.listings);
+      writeListingsCache(fetched.rawListings, fetched.version, viewerId);
       renderHome();
 
       if (state.activeTab === "my" && state.session) {
@@ -585,28 +637,30 @@ import "./config.js";
     }
   }
 
-  async function fetchListingsSummary() {
+  async function fetchListingsVersionInfo() {
     try {
-      return await fetchListingsSummaryV2();
-    } catch (error) {
-      console.warn("listListingsV2 failed; fallback to listListings", error);
-      const legacy = await apiGet("listListings", {
-        viewerId: state.session ? state.session.userId : "",
-      });
-      if (!legacy.ok) {
-        throw new Error(legacy.error || "一覧の取得に失敗しました。");
+      const result = await apiGet("getListingsVersion", {}, LISTINGS_VERSION_TIMEOUT_MS, 0);
+      if (!result.ok) {
+        return null;
       }
-      return Array.isArray(legacy.listings)
-        ? legacy.listings
-        : Array.isArray(legacy.books)
-          ? legacy.books
-          : [];
+      const version = normalizeText(result.version);
+      if (!version) {
+        return null;
+      }
+      return {
+        version,
+        totalCount: Number(result.totalCount || 0),
+      };
+    } catch {
+      return null;
     }
   }
 
-  async function fetchListingsSummaryV2() {
-    const viewerId = state.session ? state.session.userId : "";
-    const all = [];
+  async function fetchListingsSummaryV2Progressive(viewerId, initialVersion = "") {
+    const rawListings = [];
+    const normalizedListings = [];
+    const seenListingIds = new Set();
+    let currentVersion = normalizeText(initialVersion);
     let cursor = "";
     const seenCursors = new Set();
 
@@ -620,20 +674,77 @@ import "./config.js";
         throw new Error(result.error || "一覧の取得に失敗しました。");
       }
 
+      currentVersion = normalizeText(result.version || currentVersion);
       const rows = Array.isArray(result.listings) ? result.listings : [];
-      if (rows.length) {
-        all.push(...rows);
+      const appended = appendListingSummaries(rows, rawListings, normalizedListings, seenListingIds);
+      const nextCursor = normalizeText(result.nextCursor);
+      const hasMore = Boolean(nextCursor) && !seenCursors.has(nextCursor);
+
+      if (i === 0 || appended.length) {
+        state.listings = normalizedListings.slice();
+        state.listingsVersion = currentVersion;
+        state.listingsViewerId = viewerId;
+        syncDetailCacheFromSummaries(appended);
+        writeListingsCache(rawListings, currentVersion, viewerId);
+        renderHome();
       }
 
-      const nextCursor = normalizeText(result.nextCursor);
-      if (!nextCursor || seenCursors.has(nextCursor)) {
+      if (!hasMore) {
         break;
       }
+
+      setStatus(dom.homeStatus, `追加データを読み込み中... (${state.listings.length}件)`);
       seenCursors.add(nextCursor);
       cursor = nextCursor;
     }
 
-    return all;
+    return {
+      rawListings,
+      listings: normalizedListings,
+      version: currentVersion,
+    };
+  }
+
+  async function fetchListingsSummaryLegacy(viewerId, fallbackVersion = "") {
+    const legacy = await apiGet("listListings", { viewerId });
+    if (!legacy.ok) {
+      throw new Error(legacy.error || "一覧の取得に失敗しました。");
+    }
+
+    const rows = Array.isArray(legacy.listings)
+      ? legacy.listings
+      : Array.isArray(legacy.books)
+        ? legacy.books
+        : [];
+
+    const rawListings = [];
+    const normalizedListings = [];
+    appendListingSummaries(rows, rawListings, normalizedListings, new Set());
+
+    return {
+      rawListings,
+      listings: normalizedListings,
+      version: normalizeText(fallbackVersion),
+    };
+  }
+
+  function appendListingSummaries(rows, rawTarget, normalizedTarget, seenListingIds) {
+    const added = [];
+    (rows || []).forEach((row) => {
+      const listing = normalizeListing(row);
+      if (!listing.listingId || seenListingIds.has(listing.listingId)) {
+        return;
+      }
+      seenListingIds.add(listing.listingId);
+      rawTarget.push(row);
+      normalizedTarget.push(listing);
+      added.push(listing);
+    });
+    return added;
+  }
+
+  function currentViewerId() {
+    return state.session ? state.session.userId : "";
   }
 
   function syncDetailCacheFromSummaries(summaries) {

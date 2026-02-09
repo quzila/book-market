@@ -56,6 +56,17 @@ function byteLength(value) {
 
 async function main() {
   const baseUrl = readApiBaseUrl();
+  const versionUrl = new URL(baseUrl);
+  versionUrl.searchParams.set("action", "getListingsVersion");
+  const versionResult = await fetchJsonWithRetry(versionUrl.toString());
+  assert(versionResult?.ok === true, "getListingsVersion: ok が true ではありません。");
+  assert(typeof versionResult.version === "string", "getListingsVersion: version が文字列ではありません。");
+  assert(versionResult.version.length > 0, "getListingsVersion: version が空文字です。");
+  assert(
+    typeof versionResult.totalCount === "number",
+    "getListingsVersion: totalCount が数値ではありません。"
+  );
+
   const listingsUrl = new URL(baseUrl);
   listingsUrl.searchParams.set("action", "listListingsV2");
   listingsUrl.searchParams.set("limit", "50");
@@ -63,6 +74,8 @@ async function main() {
   const listResult = await fetchJsonWithRetry(listingsUrl.toString());
   assert(listResult?.ok === true, "listListingsV2: ok が true ではありません。");
   assert(Array.isArray(listResult.listings), "listListingsV2: listings が配列ではありません。");
+  assert(typeof listResult.version === "string", "listListingsV2: version が文字列ではありません。");
+  assert(listResult.version.length > 0, "listListingsV2: version が空文字です。");
   assert("nextCursor" in listResult, "listListingsV2: nextCursor がありません。");
 
   const payloadBytes = byteLength(listResult);
