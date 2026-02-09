@@ -66,6 +66,7 @@ import "./config.js";
     listings: [],
     listingsVersion: "",
     listingsViewerId: "",
+    listingsComplete: false,
     detailCache: {},
     subjectTagsRendered: false,
     previewObjectUrls: [],
@@ -462,6 +463,7 @@ import "./config.js";
     state.listings = cached.listings;
     state.listingsVersion = cached.version;
     state.listingsViewerId = cached.viewerId;
+    state.listingsComplete = Boolean(cached.complete);
     renderHome();
     setStatus(dom.homeStatus, "前回データを表示中...");
   }
@@ -474,6 +476,7 @@ import "./config.js";
           listings: [],
           version: "",
           viewerId: "",
+          complete: false,
         };
       }
       const parsed = JSON.parse(raw);
@@ -481,29 +484,33 @@ import "./config.js";
       const rows = Array.isArray(parsed?.listings) ? parsed.listings : [];
       const version = normalizeText(parsed?.version);
       const viewerId = normalizeText(parsed?.viewerId);
+      const complete = Boolean(parsed?.complete);
       if (!savedAt || Date.now() - savedAt > LISTINGS_CACHE_TTL_MS) {
         window.localStorage.removeItem(STORAGE_KEYS.listingsCache);
         return {
           listings: [],
           version: "",
           viewerId: "",
+          complete: false,
         };
       }
       return {
         listings: rows.map(normalizeListing).filter((item) => item.listingId),
         version,
         viewerId,
+        complete,
       };
     } catch {
       return {
         listings: [],
         version: "",
         viewerId: "",
+        complete: false,
       };
     }
   }
 
-  function writeListingsCache(listings, version = "", viewerId = "") {
+  function writeListingsCache(listings, version = "", viewerId = "", complete = true) {
     try {
       window.localStorage.setItem(
         STORAGE_KEYS.listingsCache,
@@ -511,6 +518,7 @@ import "./config.js";
           savedAt: Date.now(),
           version: normalizeText(version),
           viewerId: normalizeText(viewerId),
+          complete: Boolean(complete),
           listings: Array.isArray(listings) ? listings : [],
         })
       );
@@ -620,6 +628,7 @@ import "./config.js";
       const canReuseCached =
         Boolean(remoteVersion) &&
         Boolean(state.listings.length) &&
+        state.listingsComplete &&
         remoteVersion === state.listingsVersion &&
         viewerId === state.listingsViewerId;
 
@@ -630,6 +639,8 @@ import "./config.js";
         }
         return;
       }
+
+      state.listingsComplete = false;
 
       let fetched;
       try {
@@ -642,8 +653,9 @@ import "./config.js";
       state.listings = fetched.listings;
       state.listingsVersion = fetched.version;
       state.listingsViewerId = viewerId;
+      state.listingsComplete = true;
       syncDetailCacheFromSummaries(fetched.listings);
-      writeListingsCache(fetched.rawListings, fetched.version, viewerId);
+      writeListingsCache(fetched.rawListings, fetched.version, viewerId, true);
       renderHome();
 
       if (state.activeTab === "my" && state.session) {
@@ -711,8 +723,8 @@ import "./config.js";
         state.listings = normalizedListings.slice();
         state.listingsVersion = currentVersion;
         state.listingsViewerId = viewerId;
+        state.listingsComplete = false;
         syncDetailCacheFromSummaries(appended);
-        writeListingsCache(rawListings, currentVersion, viewerId);
         renderHome();
       }
 
