@@ -83,6 +83,8 @@ import "./config.js";
       currentBookMeta: null,
       currentJan: "",
       draftQueue: [],
+      editingListingId: "",
+      editingImageUrls: [],
     },
   };
 
@@ -403,6 +405,17 @@ import "./config.js";
     return Boolean(session && session.userId);
   }
 
+  function isOwnListing(listing, session = state.session) {
+    if (!listing || !session || !session.userId) {
+      return false;
+    }
+    return normalizeText(listing.sellerId) === normalizeText(session.userId);
+  }
+
+  function isEditingListing() {
+    return Boolean(normalizeText(state.seller.editingListingId));
+  }
+
   function applyAccessState() {
     const loggedIn = Boolean(state.session);
     const canPost = canCreateListing();
@@ -419,6 +432,19 @@ import "./config.js";
     dom.submitListingButton.disabled = !canPost;
     dom.queueListingButton.disabled = !canPost;
     dom.myConflictSection.classList.toggle("hidden", !canViewConflictSection());
+    updateListingFormMode();
+  }
+
+  function updateListingFormMode() {
+    if (isEditingListing()) {
+      dom.submitListingButton.textContent = "更新する";
+      dom.queueListingButton.textContent = "編集をやめる";
+      dom.queueListingButton.disabled = !canCreateListing();
+      return;
+    }
+    dom.submitListingButton.textContent = "出品する";
+    dom.queueListingButton.textContent = "続けて商品を登録する";
+    dom.queueListingButton.disabled = !canCreateListing();
   }
 
   function applyQuickCategoryButtons() {
@@ -568,6 +594,7 @@ import "./config.js";
     state.requests.detailByListingId = {};
     state.requests.wishersByListingId = {};
     state.seller.draftQueue = [];
+    clearEditingListingMode();
     clearSession();
     renderSessionState();
     renderQueuedListings();
@@ -923,7 +950,10 @@ import "./config.js";
     dom.detailImage.src = NO_IMAGE;
     dom.detailTags.innerHTML = "";
     dom.detailWantButton.dataset.listingId = "";
+    dom.detailWantButton.dataset.action = "toggle-want";
+    dom.detailWantButton.disabled = false;
     dom.detailWishersButton.dataset.listingId = "";
+    dom.detailWishersButton.dataset.action = "show-wishers";
     setStatus(dom.detailStatus, "");
   }
 
@@ -940,6 +970,7 @@ import "./config.js";
   }
 
   function renderDetailModal(listing) {
+    const ownListing = isOwnListing(listing);
     dom.detailTitle.textContent = listing.title || "タイトル未設定";
     dom.detailMeta.textContent = [
       listing.category,
@@ -966,12 +997,23 @@ import "./config.js";
 
     dom.detailWantButton.dataset.listingId = listing.listingId;
     dom.detailWishersButton.dataset.listingId = listing.listingId;
-    dom.detailWantButton.textContent = listing.alreadyWanted
-      ? "欲しい解除"
-      : state.session
-        ? "欲しい"
-        : "ログインして欲しい";
-    dom.detailWishersButton.textContent = `欲しい人 ${Number(listing.wantedCount || 0)}名`;
+    if (ownListing) {
+      dom.detailWantButton.dataset.action = "cancel-listing";
+      dom.detailWantButton.textContent = "出品取消";
+      dom.detailWantButton.disabled = false;
+      dom.detailWishersButton.dataset.action = "edit-listing";
+      dom.detailWishersButton.textContent = "編集";
+    } else {
+      dom.detailWantButton.dataset.action = "toggle-want";
+      dom.detailWantButton.textContent = listing.alreadyWanted
+        ? "欲しい解除"
+        : state.session
+          ? "欲しい"
+          : "ログインして欲しい";
+      dom.detailWantButton.disabled = false;
+      dom.detailWishersButton.dataset.action = "show-wishers";
+      dom.detailWishersButton.textContent = `欲しい人 ${Number(listing.wantedCount || 0)}名`;
+    }
 
     setStatus(dom.detailStatus, "");
   }
@@ -1086,6 +1128,11 @@ import "./config.js";
       return;
     }
 
+    if (action === "edit-listing") {
+      await openListingEditor(listing);
+      return;
+    }
+
     if (action === "show-wishers") {
       await openWishersModal(listing);
     }
@@ -1113,6 +1160,14 @@ import "./config.js";
   async function toggleWant(listing) {
     if (!state.session) {
       openLoginModal();
+      return;
+    }
+    if (isOwnListing(listing)) {
+      const message = "自分の出品には「欲しい」できません。";
+      setStatus(dom.homeStatus, message, "error");
+      if (state.detailListingId === listing.listingId) {
+        setStatus(dom.detailStatus, message, "error");
+      }
       return;
     }
 
@@ -1214,6 +1269,110 @@ import "./config.js";
     await refreshListings();
     await refreshMyPage();
     setStatus(dom.myStatus, "出品を取り消しました。", "ok");
+  }
+
+  function clearEditingListingMode() {
+    state.seller.editingListingId = "";
+    state.seller.editingImageUrls = [];
+    updateListingFormMode();
+  }
+
+  function fillListingFormForEdit(listing) {
+    const normalizedItemType = normalizeItemType(listing.itemType);
+    const subjects = Array.isArray(listing.subjectTags) ? listing.subjectTags : [];
+
+    ensureSubjectTagsRendered();
+
+    dom.itemTypeInput.value = normalizedItemType;
+    dom.categoryInput.value = normalizeText(listing.category);
+    dom.titleInput.value = normalizeText(listing.title);
+    dom.descriptionInput.value = normalizeText(listing.description || listing.summary);
+    dom.janInput.value = normalizeJan(listing.jan);
+    dom.authorInput.value = normalizeText(listing.author);
+    dom.publisherInput.value = normalizeText(listing.publisher);
+    dom.publishedDateInput.value = normalizeText(listing.publishedDate);
+
+    syncBookFieldVisibility();
+
+    const selected = uniqueStrings(subjects);
+    const selectedSet = new Set(selected);
+    const checkedSet = new Set();
+    Array.from(dom.subjectTags.querySelectorAll("input[type='checkbox']")).forEach((input) => {
+      const value = normalizeText(input.value);
+      const checked = selectedSet.has(value);
+      input.checked = checked;
+      if (checked) {
+        checkedSet.add(value);
+      }
+    });
+    dom.subjectFreeInput.value = selected.filter((subject) => !checkedSet.has(subject)).join(", ");
+
+    state.seller.currentBookMeta = null;
+    state.seller.currentJan = normalizeJan(listing.jan);
+
+    clearPreviewObjectUrls();
+    dom.imageInput.value = "";
+    renderEditingImagePreview();
+  }
+
+  function renderEditingImagePreview() {
+    dom.imagePreview.innerHTML = "";
+    const urls = Array.isArray(state.seller.editingImageUrls) ? state.seller.editingImageUrls : [];
+    urls.forEach((url, index) => {
+      const normalized = normalizeUrl(url);
+      if (!normalized) {
+        return;
+      }
+      const img = document.createElement("img");
+      img.alt = `既存画像 ${index + 1}`;
+      img.src = normalized;
+      dom.imagePreview.appendChild(img);
+    });
+  }
+
+  async function openListingEditor(listing) {
+    if (!state.session) {
+      openLoginModal();
+      return;
+    }
+    if (!isOwnListing(listing)) {
+      setStatus(dom.homeStatus, "自分の出品のみ編集できます。", "error");
+      if (state.detailListingId === listing.listingId) {
+        setStatus(dom.detailStatus, "自分の出品のみ編集できます。", "error");
+      }
+      return;
+    }
+
+    const editingFromDetail = state.detailListingId === listing.listingId;
+    if (editingFromDetail) {
+      setStatus(dom.detailStatus, "編集データを準備中...");
+    }
+
+    const detail = await loadListingDetail(listing.listingId);
+    const source = detail || listing;
+    const imageUrls = uniqueStrings([
+      ...(Array.isArray(source.imageUrls) ? source.imageUrls : []),
+      normalizeUrl(source.detailImageUrl),
+      normalizeUrl(source.thumbUrl),
+    ])
+      .map(normalizeUrl)
+      .filter(Boolean)
+      .slice(0, MAX_UPLOAD_IMAGES);
+
+    state.seller.editingListingId = source.listingId;
+    state.seller.editingImageUrls = imageUrls;
+    if (state.seller.draftQueue.length) {
+      state.seller.draftQueue = [];
+      renderQueuedListings();
+    }
+
+    fillListingFormForEdit(source);
+    updateListingFormMode();
+    if (editingFromDetail) {
+      closeDetailModal();
+    }
+    switchTab("plus");
+    setStatus(dom.listingStatus, "編集モードです。内容を変更して「更新する」を押してください。", "ok");
   }
 
   async function openWishersModal(listing) {
@@ -1430,6 +1589,16 @@ import "./config.js";
       return;
     }
 
+    if (!files.length) {
+      if (isEditingListing() && state.seller.editingImageUrls.length) {
+        renderEditingImagePreview();
+        setStatus(dom.listingStatus, "既存画像を保持して更新できます。");
+        return;
+      }
+      setStatus(dom.listingStatus, "");
+      return;
+    }
+
     files.forEach((file) => {
       const img = document.createElement("img");
       img.alt = file.name;
@@ -1441,8 +1610,6 @@ import "./config.js";
 
     if (files.length) {
       setStatus(dom.listingStatus, `${files.length}枚選択中`);
-    } else {
-      setStatus(dom.listingStatus, "");
     }
   }
 
@@ -1460,6 +1627,41 @@ import "./config.js";
 
     setListingActionBusy(true);
     try {
+      const editingListingId = normalizeText(state.seller.editingListingId);
+      if (editingListingId) {
+        setStatus(dom.listingStatus, "編集内容を準備中...");
+        const draft = await buildListingDraftFromForm();
+        const listing = await materializeListingFromDraft(draft, 1, 1);
+
+        setStatus(dom.listingStatus, "出品内容を更新中...");
+        const result = await apiPost(
+          "updateListing",
+          {
+            sellerId: state.session.userId,
+            listingId: editingListingId,
+            listing,
+          },
+          90000,
+          1
+        );
+        if (!result.ok) {
+          throw new Error(result.error || "出品更新に失敗しました。");
+        }
+
+        delete state.detailCache[editingListingId];
+        state.seller.draftQueue = [];
+        renderQueuedListings();
+        resetListingFormInputs();
+        setStatus(dom.listingStatus, "出品内容を更新しました。", "ok");
+        switchTab("home");
+        await refreshListings();
+        await refreshMyPage();
+        if (state.detailListingId === editingListingId) {
+          await loadListingDetail(editingListingId, { forceRefresh: true });
+        }
+        return;
+      }
+
       const drafts = state.seller.draftQueue.slice();
       if (isListingFormDirty()) {
         const currentDraft = await buildListingDraftFromForm();
@@ -1531,6 +1733,11 @@ import "./config.js";
     }
     if (!canCreateListing()) {
       setStatus(dom.listingStatus, "出品するにはログインしてください。", "error");
+      return;
+    }
+    if (isEditingListing()) {
+      resetListingFormInputs();
+      setStatus(dom.listingStatus, "編集モードを終了しました。", "ok");
       return;
     }
     if (state.seller.draftQueue.length >= MAX_BATCH_LISTINGS) {
@@ -1628,6 +1835,7 @@ import "./config.js";
     let publishedDate = "";
     let subjectTags = [];
     let fallbackCoverUrl = "";
+    let existingImageUrls = [];
 
     if (itemType === "book") {
       jan = normalizeJan(dom.janInput.value);
@@ -1647,6 +1855,13 @@ import "./config.js";
       subjectTags = collectSubjectTags();
     }
 
+    if (isEditingListing()) {
+      existingImageUrls = uniqueStrings(state.seller.editingImageUrls || [])
+        .map(normalizeUrl)
+        .filter(Boolean)
+        .slice(0, MAX_UPLOAD_IMAGES);
+    }
+
     const imagePayloads = await buildUploadPayloads(dom.imageInput.files);
 
     return {
@@ -1664,6 +1879,7 @@ import "./config.js";
       },
       imagePayloads,
       fallbackCoverUrl,
+      existingImageUrls,
     };
   }
 
@@ -1673,6 +1889,9 @@ import "./config.js";
       setStatus(dom.listingStatus, `画像アップロード中 (${index}/${total}) ...`);
     }
     const imageUrls = await uploadImagePayloads(payloads);
+    if (!imageUrls.length && Array.isArray(draft.existingImageUrls) && draft.existingImageUrls.length) {
+      imageUrls.push(...draft.existingImageUrls.slice(0, MAX_UPLOAD_IMAGES));
+    }
     if (!imageUrls.length && draft.fallbackCoverUrl) {
       imageUrls.push(draft.fallbackCoverUrl);
     }
@@ -1688,6 +1907,7 @@ import "./config.js";
     dom.imagePreview.innerHTML = "";
     state.seller.currentBookMeta = null;
     state.seller.currentJan = "";
+    clearEditingListingMode();
     setStatus(dom.lookupStatus, "");
     syncBookFieldVisibility();
   }
@@ -1816,8 +2036,8 @@ import "./config.js";
       myListings.forEach((listing) => {
         dom.myListingsList.appendChild(createStackItem(listing, [
           {
-            action: "show-wishers",
-            label: `欲しい人 ${Number(listing.wantedCount || 0)}名`,
+            action: "edit-listing",
+            label: "編集",
             className: "action-btn",
           },
           {

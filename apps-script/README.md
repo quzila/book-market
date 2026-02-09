@@ -112,6 +112,28 @@ request:
 }
 ```
 
+### POST `action=updateListing`
+request:
+```json
+{
+  "sellerId": "resident_105",
+  "listingId": "listing_xxx",
+  "listing": {
+    "itemType": "book",
+    "category": "書籍",
+    "title": "線形代数（第2版）",
+    "description": "状態更新済み",
+    "imageUrls": ["https://..."],
+    "jan": "9784410105784",
+    "subjectTags": ["数学"],
+    "author": "著者名",
+    "publisher": "出版社",
+    "publishedDate": "2023-04-01"
+  }
+}
+```
+- 自分の有効な出品 (`status=AVAILABLE`) のみ更新可能。
+
 ### POST `action=addInterest`
 request:
 ```json

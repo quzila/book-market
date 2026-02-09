@@ -142,6 +142,9 @@ function handleRequest_(method, e) {
       case "addListingsBatch":
         result = addListingsBatch_(req.payload);
         break;
+      case "updateListing":
+        result = updateListing_(req.payload);
+        break;
       case "addInterest":
         result = addInterest_(req.payload);
         break;
@@ -688,10 +691,8 @@ function mapSummarySnapshotForViewer_(summaryRow, viewerId) {
   var row = summaryRow || {};
   var wantedViewerIds = Array.isArray(row.wantedViewerIds) ? row.wantedViewerIds : [];
   var wantedCount = parsePositiveInt_(row.wantedCount, 0, 0, 1000000);
-  var alreadyWanted = false;
-  if (viewerId) {
-    alreadyWanted = wantedViewerIds.indexOf(viewerId) !== -1;
-  }
+  var ownListing = Boolean(viewerId && toText_(row.sellerId) === viewerId);
+  var alreadyWanted = Boolean(!ownListing && viewerId && wantedViewerIds.indexOf(viewerId) !== -1);
 
   return {
     createdAt: toText_(row.createdAt),
@@ -899,6 +900,109 @@ function buildListingRecordFromPayload_(listing, sellerId, sellerName) {
   };
 }
 
+function buildListingRecordForUpdate_(currentRow, listing) {
+  var itemType = normalizeItemType_(listing.itemType);
+  var category = toText_(listing.category) || defaultCategoryByItemType_(itemType);
+  var title = toText_(listing.title);
+  var description = toText_(listing.description);
+  var jan = normalizeJan_(listing.jan);
+
+  assert_(title, "title is required");
+  assert_(category, "category is required");
+
+  if (itemType === "book" && jan && !isValidBookJan_(jan)) {
+    throw new Error("invalid jan");
+  }
+
+  var imageUrls = sanitizeUrlArray_(listing.imageUrls, 5);
+  var subjectTags = itemType === "book" ? sanitizeTextArray_(listing.subjectTags, 20) : [];
+
+  return {
+    created_at: toText_(currentRow.created_at),
+    listing_id: toText_(currentRow.listing_id),
+    item_type: itemType,
+    category: category,
+    title: title,
+    description: description,
+    image_urls_json: JSON.stringify(imageUrls),
+    jan: itemType === "book" ? jan : "",
+    subject_tags_json: JSON.stringify(subjectTags),
+    author: itemType === "book" ? toText_(listing.author) : "",
+    publisher: itemType === "book" ? toText_(listing.publisher) : "",
+    published_date: itemType === "book" ? toText_(listing.publishedDate) : "",
+    seller_name: toText_(currentRow.seller_name),
+    seller_id: toText_(currentRow.seller_id),
+    status: DEFAULT_STATUS,
+  };
+}
+
+function updateListing_(payload) {
+  var payloadObj = payload || {};
+  var sellerId = toText_(payloadObj.sellerId);
+  var listingId = toText_(payloadObj.listingId);
+  var listing = payloadObj.listing || {};
+
+  assert_(sellerId, "sellerId is required");
+  assert_(listingId, "listingId is required");
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
+  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+  if (sheet.getLastRow() <= 1) {
+    throw new Error("listing not found");
+  }
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, LISTINGS_HEADERS.length).getValues();
+  var listingIndex = LISTINGS_HEADERS.indexOf("listing_id");
+  var sellerIndex = LISTINGS_HEADERS.indexOf("seller_id");
+  var statusIndex = LISTINGS_HEADERS.indexOf("status");
+  var rowToUpdate = 0;
+  var currentRow = null;
+
+  for (var i = 0; i < values.length; i += 1) {
+    var rowListingId = toText_(values[i][listingIndex]);
+    if (rowListingId !== listingId) {
+      continue;
+    }
+
+    var rowSellerId = toText_(values[i][sellerIndex]);
+    if (rowSellerId !== sellerId) {
+      throw new Error("only seller can update listing");
+    }
+
+    var rowStatus = toText_(values[i][statusIndex]) || DEFAULT_STATUS;
+    if (rowStatus !== DEFAULT_STATUS) {
+      throw new Error("only available listing can be updated");
+    }
+
+    currentRow = {};
+    for (var j = 0; j < LISTINGS_HEADERS.length; j += 1) {
+      currentRow[LISTINGS_HEADERS[j]] = values[i][j];
+    }
+    rowToUpdate = i + 2;
+    break;
+  }
+
+  if (!rowToUpdate || !currentRow) {
+    throw new Error("listing not found");
+  }
+
+  var nextRow = buildListingRecordForUpdate_(currentRow, listing);
+  var out = [];
+  for (var k = 0; k < LISTINGS_HEADERS.length; k += 1) {
+    var header = LISTINGS_HEADERS[k];
+    out.push(nextRow[header] !== undefined ? nextRow[header] : "");
+  }
+
+  sheet.getRange(rowToUpdate, 1, 1, LISTINGS_HEADERS.length).setValues([out]);
+  invalidateMarketplaceCache_();
+
+  return {
+    ok: true,
+    listingId: listingId,
+    listing: mapListingRowToResponse_(nextRow, {}, sellerId),
+  };
+}
+
 function addInterest_(payload) {
   var viewerId = toText_(payload.viewerId);
   var viewerName = toText_(payload.viewerName);
@@ -910,6 +1014,9 @@ function addInterest_(payload) {
 
   var listing = findListingById_(listingId);
   assert_(listing, "listing not found");
+  if (toText_(listing.seller_id) === viewerId) {
+    throw new Error("cannot add interest to own listing");
+  }
 
   var snapshot = readMarketplaceSnapshot_();
   var interests = snapshot.interests || [];
@@ -1076,10 +1183,11 @@ function listMyPage_(payload, params) {
 
   for (var i = 0; i < responses.length; i += 1) {
     var listing = responses[i];
-    if (listing.alreadyWanted) {
+    var ownListing = toText_(listing.sellerId) === viewerId;
+    if (listing.alreadyWanted && !ownListing) {
       wantedListings.push(listing);
     }
-    if (toText_(listing.sellerId) === viewerId) {
+    if (ownListing) {
       myListings.push(listing);
     }
   }
@@ -1245,6 +1353,7 @@ function mapListingRowToSummaryResponse_(row, interestMap, viewerId) {
   var subjectTags = parseJsonArray_(row.subject_tags_json);
   var variants = resolveListingImageVariants_(row);
   var wantedCount = objectKeys_(interestMap).length;
+  var ownListing = Boolean(viewerId && toText_(row.seller_id) === viewerId);
 
   return {
     createdAt: toText_(row.created_at),
@@ -1262,7 +1371,7 @@ function mapListingRowToSummaryResponse_(row, interestMap, viewerId) {
     sellerId: toText_(row.seller_id),
     status: toText_(row.status) || DEFAULT_STATUS,
     wantedCount: wantedCount,
-    alreadyWanted: Boolean(viewerId && interestMap && interestMap[viewerId]),
+    alreadyWanted: Boolean(!ownListing && viewerId && interestMap && interestMap[viewerId]),
   };
 }
 
@@ -1320,6 +1429,7 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
   var listingId = toText_(row.listing_id);
   var subjectTags = parseJsonArray_(row.subject_tags_json);
   var variants = resolveListingImageVariants_(row);
+  var ownListing = Boolean(viewerId && toText_(row.seller_id) === viewerId);
 
   return {
     createdAt: toText_(row.created_at),
@@ -1340,7 +1450,7 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
     sellerId: toText_(row.seller_id),
     status: toText_(row.status) || DEFAULT_STATUS,
     wantedCount: wantedBy.length,
-    alreadyWanted: Boolean(viewerId && interestMap && interestMap[viewerId]),
+    alreadyWanted: Boolean(!ownListing && viewerId && interestMap && interestMap[viewerId]),
     wantedBy: wantedBy,
   };
 }
