@@ -8,6 +8,7 @@
   const STORAGE_KEYS = {
     session: "dorm-market-session-v2",
     activeTab: "dorm-market-active-tab-v2",
+    listingsCache: "dorm-market-listings-cache-v1",
   };
 
   const SUBJECT_OPTIONS = [
@@ -39,6 +40,12 @@
   const BOOK_RETRY_DELAY_MS = 1200;
   const BOOK_SUMMARY_FALLBACK = "概要は取得できませんでした。説明欄の追記をご利用ください。";
   const BOOK_MIN_SUMMARY_LENGTH = 24;
+  const LISTINGS_CACHE_TTL_MS = 1000 * 60 * 8;
+  const MAX_UPLOAD_IMAGES = 5;
+  const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024;
+  const IMAGE_UPLOAD_CONCURRENCY = 3;
+  const UPLOAD_MAX_EDGE = 1800;
+  const UPLOAD_JPEG_QUALITY = 0.84;
 
   const state = {
     apiBaseUrl: sanitizeUrl(APP_CONFIG.APPS_SCRIPT_BASE_URL || FIXED_APPS_SCRIPT_BASE_URL),
@@ -54,6 +61,10 @@
     myPage: {
       wanted: [],
       mine: [],
+    },
+    requests: {
+      listings: null,
+      myPage: null,
     },
     seller: {
       currentBookMeta: null,
@@ -152,6 +163,7 @@
     bindEvents();
     renderSessionState();
     switchTab(state.activeTab, { persist: false });
+    hydrateListingsFromCache();
     refreshListings();
   }
 
@@ -209,7 +221,7 @@
         window.clearTimeout(searchTimer);
       }
       searchTimer = window.setTimeout(() => {
-        state.filters.q = normalizeText(dom.searchInput.value).toLowerCase();
+        state.filters.q = normalizeText(dom.searchInput.value);
         renderHome();
       }, 220);
     });
@@ -388,6 +400,49 @@
     });
   }
 
+  function hydrateListingsFromCache() {
+    const cached = loadListingsCache();
+    if (!cached.length) {
+      return;
+    }
+    state.listings = cached;
+    renderHome();
+    setStatus(dom.homeStatus, "前回データを表示中...");
+  }
+
+  function loadListingsCache() {
+    try {
+      const raw = window.localStorage.getItem(STORAGE_KEYS.listingsCache);
+      if (!raw) {
+        return [];
+      }
+      const parsed = JSON.parse(raw);
+      const savedAt = Number(parsed?.savedAt || 0);
+      const rows = Array.isArray(parsed?.listings) ? parsed.listings : [];
+      if (!savedAt || Date.now() - savedAt > LISTINGS_CACHE_TTL_MS) {
+        window.localStorage.removeItem(STORAGE_KEYS.listingsCache);
+        return [];
+      }
+      return rows.map(normalizeListing).filter((item) => item.listingId);
+    } catch {
+      return [];
+    }
+  }
+
+  function writeListingsCache(listings) {
+    try {
+      window.localStorage.setItem(
+        STORAGE_KEYS.listingsCache,
+        JSON.stringify({
+          savedAt: Date.now(),
+          listings: Array.isArray(listings) ? listings : [],
+        })
+      );
+    } catch {
+      // ignore quota errors
+    }
+  }
+
   function openLoginModal() {
     state.pendingResident = null;
     dom.roomNumberInput.value = "";
@@ -455,9 +510,6 @@
     renderSessionState();
     closeLoginModal();
     refreshListings();
-    if (state.activeTab === "my") {
-      refreshMyPage();
-    }
   }
 
   function handleLogout() {
@@ -473,31 +525,44 @@
   }
 
   async function refreshListings() {
-    setStatus(dom.homeStatus, "一覧を読み込み中...");
-    const result = await apiGet("listListings", {
-      viewerId: state.session ? state.session.userId : "",
-      q: state.filters.q,
-    });
-
-    if (!result.ok) {
-      state.listings = [];
-      dom.listingGrid.innerHTML = "";
-      closeDetailModal();
-      setStatus(dom.homeStatus, result.error || "一覧の取得に失敗しました。", "error");
-      return;
+    if (state.requests.listings) {
+      return state.requests.listings;
     }
 
-    const rawListings = Array.isArray(result.listings)
-      ? result.listings
-      : Array.isArray(result.books)
-        ? result.books
-        : [];
+    state.requests.listings = (async () => {
+      setStatus(dom.homeStatus, "一覧を読み込み中...");
+      const result = await apiGet("listListings", {
+        viewerId: state.session ? state.session.userId : "",
+      });
 
-    state.listings = rawListings.map(normalizeListing);
-    renderHome();
+      if (!result.ok) {
+        if (!state.listings.length) {
+          dom.listingGrid.innerHTML = "";
+          closeDetailModal();
+        }
+        setStatus(dom.homeStatus, result.error || "一覧の取得に失敗しました。", "error");
+        return;
+      }
 
-    if (state.activeTab === "my" && state.session) {
-      refreshMyPage();
+      const rawListings = Array.isArray(result.listings)
+        ? result.listings
+        : Array.isArray(result.books)
+          ? result.books
+          : [];
+
+      state.listings = rawListings.map(normalizeListing).filter((item) => item.listingId);
+      writeListingsCache(rawListings);
+      renderHome();
+
+      if (state.activeTab === "my" && state.session) {
+        await refreshMyPage();
+      }
+    })();
+
+    try {
+      return await state.requests.listings;
+    } finally {
+      state.requests.listings = null;
     }
   }
 
@@ -514,9 +579,11 @@
       return;
     }
 
+    const fragment = document.createDocumentFragment();
     filtered.forEach((listing) => {
-      dom.listingGrid.appendChild(createListingCard(listing));
+      fragment.appendChild(createListingCard(listing));
     });
+    dom.listingGrid.appendChild(fragment);
 
     syncDetailModal();
     setStatus(dom.homeStatus, `${filtered.length}件を表示中`, "ok");
@@ -524,28 +591,24 @@
 
   function filterListings(listings) {
     const category = state.filters.category;
-    const q = normalizeText(state.filters.q).toLowerCase();
+    const queryTokens = parseSearchTokens(state.filters.q);
 
     return listings.filter((listing) => {
       if (category && normalizeItemType(listing.itemType) !== category) {
         return false;
       }
 
-      if (q) {
-        const text = [
-          listing.title,
-          listing.description,
-          listing.summary,
-          listing.category,
-          listing.sellerName,
-          listing.author,
-          listing.publisher,
-          listing.subjectTags.join(" "),
-        ]
-          .join(" ")
-          .toLowerCase();
+      if (queryTokens.length) {
+        const rawIndex = normalizeSearchText(listing.searchRaw || buildListingSearchText(listing));
+        const phoneticIndex = listing.searchPhonetic || toPhoneticSearchKey(rawIndex);
 
-        if (!text.includes(q)) {
+        const matched = queryTokens.every((token) => {
+          const rawMatch = token.raw ? rawIndex.includes(token.raw) : false;
+          const phoneticMatch = token.phonetic ? phoneticIndex.includes(token.phonetic) : false;
+          return rawMatch || phoneticMatch;
+        });
+
+        if (!matched) {
           return false;
         }
       }
@@ -564,12 +627,9 @@
 
     const photo = document.createElement("img");
     photo.className = "listing-photo";
-    photo.src = firstImage(listing);
     photo.alt = `${listing.title || "商品"} の画像`;
     photo.loading = "lazy";
-    photo.onerror = () => {
-      photo.src = NO_IMAGE;
-    };
+    setImageWithFallback(photo, imageCandidatesFromListing(listing));
 
     const title = document.createElement("h3");
     title.className = "listing-title";
@@ -659,6 +719,7 @@
     dom.detailTitle.textContent = "-";
     dom.detailMeta.textContent = "-";
     dom.detailDescription.textContent = "-";
+    dom.detailImage.onerror = null;
     dom.detailImage.src = NO_IMAGE;
     dom.detailTags.innerHTML = "";
     dom.detailWantButton.dataset.listingId = "";
@@ -692,11 +753,8 @@
       .join(" / ");
     dom.detailDescription.textContent = listing.description || listing.summary || "説明は未入力です。";
 
-    dom.detailImage.src = firstImage(listing);
     dom.detailImage.alt = `${listing.title || "商品"} の画像`;
-    dom.detailImage.onerror = () => {
-      dom.detailImage.src = NO_IMAGE;
-    };
+    setImageWithFallback(dom.detailImage, imageCandidatesFromListing(listing));
 
     dom.detailTags.innerHTML = "";
     appendTag(dom.detailTags, listing.itemTypeLabel || listingTypeLabel(listing.itemType));
@@ -795,9 +853,6 @@
     }
 
     await refreshListings();
-    if (state.activeTab === "my") {
-      await refreshMyPage();
-    }
     if (state.detailListingId === listing.listingId) {
       setStatus(dom.detailStatus, "更新しました。", "ok");
     }
@@ -820,7 +875,6 @@
     }
 
     await refreshListings();
-    await refreshMyPage();
   }
 
   function openWishersModal(listing) {
@@ -940,7 +994,7 @@
     dom.imagePreview.innerHTML = "";
     const files = Array.from(dom.imageInput.files || []);
 
-    if (files.length > 5) {
+    if (files.length > MAX_UPLOAD_IMAGES) {
       setStatus(dom.listingStatus, "画像は最大5枚までです。", "error");
       dom.imageInput.value = "";
       return;
@@ -1006,38 +1060,21 @@
           throw new Error("JAN/ISBN-13 が正しくありません。");
         }
 
-        if (jan) {
-          if (!state.seller.currentBookMeta || state.seller.currentJan !== jan) {
-            const meta = await lookupBookByJan(jan, { forceRefresh: true });
-            state.seller.currentBookMeta = meta;
-            state.seller.currentJan = jan;
-          }
-          fallbackCoverUrl = normalizeText(
-            state.seller.currentBookMeta.coverUrl || state.seller.currentBookMeta.coverCandidates[0]
-          );
+        const activeBookMeta =
+          jan && state.seller.currentBookMeta && state.seller.currentJan === jan ? state.seller.currentBookMeta : null;
+        if (activeBookMeta) {
+          fallbackCoverUrl = normalizeText(activeBookMeta.coverUrl || activeBookMeta.coverCandidates?.[0]);
         }
 
-        author = normalizeText(dom.authorInput.value) || normalizeText(state.seller.currentBookMeta?.author);
-        publisher = normalizeText(dom.publisherInput.value) || normalizeText(state.seller.currentBookMeta?.publisher);
+        author = normalizeText(dom.authorInput.value) || normalizeText(activeBookMeta?.author);
+        publisher = normalizeText(dom.publisherInput.value) || normalizeText(activeBookMeta?.publisher);
         publishedDate =
-          normalizeText(dom.publishedDateInput.value) || normalizeText(state.seller.currentBookMeta?.publishedDate);
+          normalizeText(dom.publishedDateInput.value) || normalizeText(activeBookMeta?.publishedDate);
         subjectTags = collectSubjectTags();
       }
 
-      setStatus(dom.listingStatus, "画像をアップロード中...");
       const payloads = await buildUploadPayloads(dom.imageInput.files);
-      let imageUrls = [];
-
-      for (let i = 0; i < payloads.length; i += 1) {
-        setStatus(dom.listingStatus, `画像アップロード中 (${i + 1}/${payloads.length}) ...`);
-        const upload = await apiPost("uploadImage", payloads[i], 90000, 1);
-        if (!upload.ok) {
-          throw new Error(upload.error || "画像アップロードに失敗しました。");
-        }
-        if (upload.imageUrl) {
-          imageUrls.push(upload.imageUrl);
-        }
-      }
+      const imageUrls = await uploadImagePayloads(payloads);
 
       if (!imageUrls.length && fallbackCoverUrl) {
         imageUrls.push(fallbackCoverUrl);
@@ -1082,9 +1119,6 @@
 
       switchTab("home");
       await refreshListings();
-      if (state.session) {
-        await refreshMyPage();
-      }
     } catch (error) {
       setStatus(dom.listingStatus, String(error.message || error), "error");
     } finally {
@@ -1110,18 +1144,30 @@
       return;
     }
 
-    setStatus(dom.myStatus, "マイページを読み込み中...");
-    const result = await apiGet("listMyPage", { viewerId: state.session.userId }, 45000, 2);
-
-    if (!result.ok) {
-      setStatus(dom.myStatus, result.error || "マイページ取得に失敗しました。", "error");
-      return;
+    if (state.requests.myPage) {
+      return state.requests.myPage;
     }
 
-    state.myPage.wanted = (result.wantedListings || []).map(normalizeListing);
-    state.myPage.mine = (result.myListings || []).map(normalizeListing);
+    state.requests.myPage = (async () => {
+      setStatus(dom.myStatus, "マイページを読み込み中...");
+      const result = await apiGet("listMyPage", { viewerId: state.session.userId }, 45000, 2);
 
-    renderMyPage(state.myPage.wanted, state.myPage.mine, state.myPage.mine);
+      if (!result.ok) {
+        setStatus(dom.myStatus, result.error || "マイページ取得に失敗しました。", "error");
+        return;
+      }
+
+      state.myPage.wanted = (result.wantedListings || []).map(normalizeListing).filter((item) => item.listingId);
+      state.myPage.mine = (result.myListings || []).map(normalizeListing).filter((item) => item.listingId);
+
+      renderMyPage(state.myPage.wanted, state.myPage.mine, state.myPage.mine);
+    })();
+
+    try {
+      return await state.requests.myPage;
+    } finally {
+      state.requests.myPage = null;
+    }
   }
 
   function renderMyPage(wantedListings, myListings, conflictSourceListings = []) {
@@ -1332,7 +1378,7 @@
 
     const wantedCount = Number(raw?.wantedCount || raw?.wanted_count || wantedBy.length || 0);
 
-    return {
+    const listing = {
       listingId,
       itemType,
       itemTypeLabel: listingTypeLabel(itemType),
@@ -1340,7 +1386,7 @@
       title: normalizeText(raw?.title),
       description: normalizeText(raw?.description),
       summary: normalizeText(raw?.summary),
-      imageUrls: parseArray(raw?.imageUrls || raw?.image_urls || raw?.image_urls_json),
+      imageUrls: parseArray(raw?.imageUrls || raw?.image_urls || raw?.image_urls_json).map(normalizeUrl).filter(Boolean),
       coverUrl: normalizeUrl(raw?.coverUrl || raw?.cover_url),
       jan: normalizeJan(raw?.jan),
       subjectTags: parseArray(raw?.subjectTags || raw?.subject_tags || raw?.subject_tags_json).map(normalizeText),
@@ -1355,6 +1401,10 @@
       wantedBy,
       alreadyWanted: Boolean(raw?.alreadyWanted || raw?.already_wanted),
     };
+
+    listing.searchRaw = buildListingSearchText(listing);
+    listing.searchPhonetic = toPhoneticSearchKey(listing.searchRaw);
+    return listing;
   }
 
   function parseArray(value) {
@@ -1366,15 +1416,173 @@
         const parsed = JSON.parse(value);
         return Array.isArray(parsed) ? parsed : [];
       } catch {
-        return [];
+        const text = normalizeText(value);
+        if (!text) {
+          return [];
+        }
+        if (/^(https?:\/\/|data:image\/)/i.test(text)) {
+          return [text];
+        }
+        if (text.includes(",")) {
+          return text
+            .split(",")
+            .map((token) => normalizeText(token))
+            .filter(Boolean);
+        }
+        return [text];
       }
     }
     return [];
   }
 
-  function firstImage(listing) {
-    const first = Array.isArray(listing.imageUrls) && listing.imageUrls.length ? normalizeUrl(listing.imageUrls[0]) : "";
-    return first || normalizeUrl(listing.coverUrl) || NO_IMAGE;
+  function buildListingSearchText(listing) {
+    return normalizeSearchText(
+      [
+        listing.title,
+        listing.description,
+        listing.summary,
+        listing.category,
+        listing.itemTypeLabel || listingTypeLabel(listing.itemType),
+        listing.sellerName,
+        listing.author,
+        listing.publisher,
+        listing.jan,
+        listing.subjectTags.join(" "),
+      ].join(" ")
+    );
+  }
+
+  function normalizeSearchText(value) {
+    const text = normalizeText(value);
+    if (!text) {
+      return "";
+    }
+    return text.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function toPhoneticSearchKey(value) {
+    const text = toHiragana(normalizeSearchText(value));
+    if (!text) {
+      return "";
+    }
+
+    const smallKanaMap = {
+      ぁ: "あ",
+      ぃ: "い",
+      ぅ: "う",
+      ぇ: "え",
+      ぉ: "お",
+      っ: "つ",
+      ゃ: "や",
+      ゅ: "ゆ",
+      ょ: "よ",
+      ゎ: "わ",
+      ゕ: "か",
+      ゖ: "け",
+    };
+
+    return text
+      .normalize("NFD")
+      .replace(/[\u3099\u309A]/g, "")
+      .replace(/[ぁぃぅぇぉっゃゅょゎゕゖ]/g, (char) => smallKanaMap[char] || char)
+      .replace(/[ーｰ〜～]/g, "")
+      .replace(/[^0-9a-zぁ-ん]/g, "");
+  }
+
+  function parseSearchTokens(query) {
+    const normalized = normalizeSearchText(query);
+    if (!normalized) {
+      return [];
+    }
+    const rawTokens = uniqueStrings(
+      normalized
+        .split(/\s+/)
+        .map((token) => normalizeText(token))
+        .filter(Boolean)
+    );
+    return rawTokens.map((raw) => ({
+      raw,
+      phonetic: toPhoneticSearchKey(raw),
+    }));
+  }
+
+  function toHiragana(text) {
+    return normalizeText(text).replace(/[ァ-ヶ]/g, (char) => String.fromCharCode(char.charCodeAt(0) - 0x60));
+  }
+
+  function imageCandidatesFromListing(listing) {
+    const originals = uniqueStrings([
+      ...(Array.isArray(listing.imageUrls) ? listing.imageUrls : []),
+      normalizeUrl(listing.coverUrl),
+    ]);
+
+    const expanded = [];
+    originals.forEach((url) => {
+      expandImageUrlCandidates(url).forEach((candidate) => {
+        if (!candidate || expanded.includes(candidate)) {
+          return;
+        }
+        expanded.push(candidate);
+      });
+    });
+    return expanded.length ? expanded : [NO_IMAGE];
+  }
+
+  function expandImageUrlCandidates(url) {
+    const normalized = normalizeUrl(url);
+    if (!normalized) {
+      return [];
+    }
+
+    const driveId = extractGoogleDriveFileId(normalized);
+    if (!driveId) {
+      return [normalized];
+    }
+
+    const encodedId = encodeURIComponent(driveId);
+    return uniqueStrings([
+      `https://lh3.googleusercontent.com/d/${encodedId}=w1600`,
+      `https://drive.google.com/thumbnail?id=${encodedId}&sz=w1600`,
+      `https://drive.google.com/uc?export=view&id=${encodedId}`,
+      normalized,
+    ]);
+  }
+
+  function extractGoogleDriveFileId(url) {
+    const text = normalizeText(url);
+    if (!text) {
+      return "";
+    }
+
+    const patterns = [
+      /[?&]id=([a-zA-Z0-9_-]{20,})/,
+      /\/d\/([a-zA-Z0-9_-]{20,})/,
+      /\/d\/([a-zA-Z0-9_-]{20,})=/,
+    ];
+
+    for (const pattern of patterns) {
+      const match = text.match(pattern);
+      if (match && match[1]) {
+        return match[1];
+      }
+    }
+
+    return "";
+  }
+
+  function setImageWithFallback(img, candidates) {
+    const queue = Array.isArray(candidates) ? candidates.slice() : [];
+    const next = () => {
+      const candidate = queue.shift();
+      if (!candidate) {
+        img.onerror = null;
+        img.src = NO_IMAGE;
+        return;
+      }
+      img.onerror = next;
+      img.src = candidate;
+    };
+    next();
   }
 
   function toTimestamp(value) {
@@ -1388,28 +1596,156 @@
     if (!files.length) {
       return [];
     }
-    if (files.length > 5) {
+    if (files.length > MAX_UPLOAD_IMAGES) {
       throw new Error("画像は最大5枚までです。");
     }
 
-    const payloads = [];
-    for (const file of files) {
-      if (!file.type.startsWith("image/")) {
-        throw new Error("画像ファイルのみアップロードできます。");
-      }
-      if (file.size > 8 * 1024 * 1024) {
-        throw new Error("画像は1枚8MB以下にしてください。");
-      }
+    return await Promise.all(files.map((file, index) => buildUploadPayload(file, index)));
+  }
 
-      const dataUrl = await readFileAsDataUrl(file);
-      payloads.push({
-        fileName: file.name || `image-${Date.now()}.jpg`,
-        mimeType: file.type || "image/jpeg",
-        dataUrl,
-      });
+  async function buildUploadPayload(file, index) {
+    if (!file.type.startsWith("image/")) {
+      throw new Error("画像ファイルのみアップロードできます。");
+    }
+    if (file.size > MAX_UPLOAD_FILE_BYTES) {
+      throw new Error("画像は1枚8MB以下にしてください。");
     }
 
-    return payloads;
+    const optimized = await optimizeImageForUpload(file);
+    return {
+      fileName: resolveUploadFileName(file.name, optimized.mimeType, index),
+      mimeType: optimized.mimeType,
+      dataUrl: optimized.dataUrl,
+    };
+  }
+
+  async function uploadImagePayloads(payloads) {
+    const list = Array.isArray(payloads) ? payloads : [];
+    if (!list.length) {
+      return [];
+    }
+
+    const queue = list.map((payload, index) => ({ payload, index }));
+    const uploaded = new Array(list.length);
+    let completed = 0;
+
+    setStatus(dom.listingStatus, `画像アップロード中 (0/${list.length}) ...`);
+
+    const workerCount = Math.min(IMAGE_UPLOAD_CONCURRENCY, queue.length);
+    const workers = Array.from({ length: workerCount }, () =>
+      (async () => {
+        while (queue.length) {
+          const task = queue.shift();
+          if (!task) {
+            return;
+          }
+
+          const upload = await apiPost("uploadImage", task.payload, 90000, 1);
+          if (!upload.ok) {
+            throw new Error(upload.error || "画像アップロードに失敗しました。");
+          }
+
+          uploaded[task.index] = normalizeUrl(upload.imageUrl);
+          completed += 1;
+          setStatus(dom.listingStatus, `画像アップロード中 (${completed}/${list.length}) ...`);
+        }
+      })()
+    );
+
+    await Promise.all(workers);
+    return uploaded.filter(Boolean);
+  }
+
+  async function optimizeImageForUpload(file) {
+    const originalMimeType = normalizeText(file.type) || "image/jpeg";
+    const originalDataUrl = await readFileAsDataUrl(file);
+
+    if (originalMimeType === "image/gif" || originalMimeType === "image/svg+xml") {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    let image;
+    try {
+      image = await loadImageElement(originalDataUrl);
+    } catch {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    const width = Number(image.naturalWidth || image.width || 0);
+    const height = Number(image.naturalHeight || image.height || 0);
+    if (!width || !height) {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    const scale = Math.min(1, UPLOAD_MAX_EDGE / Math.max(width, height));
+    if (scale >= 0.999 && file.size <= 1.5 * 1024 * 1024) {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    const targetWidth = Math.max(1, Math.round(width * scale));
+    const targetHeight = Math.max(1, Math.round(height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, targetWidth, targetHeight);
+    ctx.drawImage(image, 0, 0, targetWidth, targetHeight);
+
+    const compressedDataUrl = canvas.toDataURL("image/jpeg", UPLOAD_JPEG_QUALITY);
+    if (!compressedDataUrl || compressedDataUrl.length >= originalDataUrl.length * 0.98) {
+      return {
+        mimeType: originalMimeType,
+        dataUrl: originalDataUrl,
+      };
+    }
+
+    return {
+      mimeType: "image/jpeg",
+      dataUrl: compressedDataUrl,
+    };
+  }
+
+  function resolveUploadFileName(fileName, mimeType, index) {
+    const rawName = normalizeText(fileName).replace(/\.[^.]+$/, "");
+    const base = rawName || `image-${Date.now()}-${index + 1}`;
+    const safe = base.replace(/[^\w.-]+/g, "_");
+    if (mimeType === "image/png") {
+      return safe.endsWith(".png") ? safe : `${safe}.png`;
+    }
+    if (mimeType === "image/webp") {
+      return safe.endsWith(".webp") ? safe : `${safe}.webp`;
+    }
+    return safe.endsWith(".jpg") || safe.endsWith(".jpeg") ? safe : `${safe}.jpg`;
+  }
+
+  function loadImageElement(dataUrl) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("画像の読み込みに失敗しました。"));
+      img.src = dataUrl;
+    });
   }
 
   function readFileAsDataUrl(file) {

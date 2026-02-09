@@ -41,6 +41,10 @@ var LEGACY_INTEREST_HEADERS = ["created_at", "interest_id", "book_id", "jan", "v
 
 var DEFAULT_STATUS = "AVAILABLE";
 var UPLOAD_FOLDER_ID = "";
+var MARKET_SNAPSHOT_CACHE_KEY = "market_snapshot_v2";
+var MARKET_SNAPSHOT_TTL_SEC = 30;
+var SCHEMA_CACHE_KEY = "market_schema_ok_v2";
+var SCHEMA_CACHE_TTL_SEC = 3600;
 
 var RESIDENTS_BY_ROOM = {
   "105": "坪田　晴琉",
@@ -211,6 +215,10 @@ function safeJsonParse_(text) {
 }
 
 function ensureSchema_() {
+  if (readFromCache_(SCHEMA_CACHE_KEY) === "1") {
+    return;
+  }
+
   var ss = SpreadsheetApp.getActiveSpreadsheet();
 
   var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
@@ -227,6 +235,57 @@ function ensureSchema_() {
 
   migrateLegacyBooksSheetIfNeeded_(ss, listingsSheet);
   migrateLegacyInterestsSheetIfNeeded_(interestsSheet);
+  writeToCache_(SCHEMA_CACHE_KEY, "1", SCHEMA_CACHE_TTL_SEC);
+}
+
+function readMarketplaceSnapshot_() {
+  var cached = readFromCache_(MARKET_SNAPSHOT_CACHE_KEY);
+  if (cached) {
+    try {
+      var parsed = JSON.parse(cached);
+      if (parsed && parsed.listings && parsed.interests) {
+        return parsed;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  var snapshot = {
+    listings: readObjectsByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS),
+    interests: readObjectsByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS),
+  };
+
+  writeToCache_(MARKET_SNAPSHOT_CACHE_KEY, JSON.stringify(snapshot), MARKET_SNAPSHOT_TTL_SEC);
+  return snapshot;
+}
+
+function invalidateMarketplaceCache_() {
+  removeFromCache_(MARKET_SNAPSHOT_CACHE_KEY);
+}
+
+function readFromCache_(key) {
+  try {
+    return CacheService.getScriptCache().get(key);
+  } catch (error) {
+    return "";
+  }
+}
+
+function writeToCache_(key, value, ttlSec) {
+  try {
+    CacheService.getScriptCache().put(key, value, ttlSec);
+  } catch (error) {
+    // ignore cache write failures (size/quota)
+  }
+}
+
+function removeFromCache_(key) {
+  try {
+    CacheService.getScriptCache().remove(key);
+  } catch (error) {
+    // ignore cache failures
+  }
 }
 
 function ensureSheetWithHeaderMigration_(sheet, targetHeaders, typeName) {
@@ -425,8 +484,9 @@ function listListings_(payload, params) {
   var subject = normalizeQuery_((payload && payload.subject) || (params && params.subject));
   var q = normalizeQuery_((payload && payload.q) || (params && params.q));
 
-  var listings = readObjectsByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS);
-  var interests = readObjectsByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS);
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
 
   var responses = buildListingResponses_(listings, interests, viewerId);
   var filtered = [];
@@ -496,6 +556,7 @@ function addListing_(payload) {
   };
 
   appendObjectRowByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS, record);
+  invalidateMarketplaceCache_();
 
   return {
     ok: true,
@@ -516,7 +577,8 @@ function addInterest_(payload) {
   var listing = findListingById_(listingId);
   assert_(listing, "listing not found");
 
-  var interests = readObjectsByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS);
+  var snapshot = readMarketplaceSnapshot_();
+  var interests = snapshot.interests || [];
   for (var i = 0; i < interests.length; i += 1) {
     var row = interests[i];
     if (toText_(row.listing_id) === listingId && toText_(row.viewer_id) === viewerId) {
@@ -536,6 +598,7 @@ function addInterest_(payload) {
   };
 
   appendObjectRowByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS, record);
+  invalidateMarketplaceCache_();
 
   return {
     ok: true,
@@ -574,6 +637,9 @@ function removeInterest_(payload) {
   for (var j = rowsToDelete.length - 1; j >= 0; j -= 1) {
     sheet.deleteRow(rowsToDelete[j]);
   }
+  if (rowsToDelete.length > 0) {
+    invalidateMarketplaceCache_();
+  }
 
   return {
     ok: true,
@@ -586,8 +652,9 @@ function listMyPage_(payload, params) {
   var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
   assert_(viewerId, "viewerId is required");
 
-  var listings = readObjectsByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS);
-  var interests = readObjectsByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS);
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
   var responses = buildListingResponses_(listings, interests, viewerId);
 
   var wantedListings = [];
@@ -611,8 +678,9 @@ function listMyPage_(payload, params) {
 }
 
 function listConflicts_() {
-  var listings = readObjectsByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS);
-  var interests = readObjectsByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS);
+  var snapshot = readMarketplaceSnapshot_();
+  var listings = snapshot.listings || [];
+  var interests = snapshot.interests || [];
   var responses = buildListingResponses_(listings, interests, "");
 
   var conflicts = [];
@@ -698,7 +766,7 @@ function parseDataUrl_(dataUrl, fallbackMimeType) {
 }
 
 function buildDriveImageUrl_(fileId) {
-  return "https://drive.google.com/uc?export=view&id=" + encodeURIComponent(fileId);
+  return "https://drive.google.com/thumbnail?id=" + encodeURIComponent(fileId) + "&sz=w1600";
 }
 
 function buildListingResponses_(listingRows, interests, viewerId) {
@@ -808,7 +876,8 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
 }
 
 function findListingById_(listingId) {
-  var rows = readObjectsByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS);
+  var snapshot = readMarketplaceSnapshot_();
+  var rows = snapshot.listings || [];
   for (var i = 0; i < rows.length; i += 1) {
     if (toText_(rows[i].listing_id) === listingId) {
       return rows[i];
@@ -901,11 +970,10 @@ function sanitizeUrlArray_(values, maxLen) {
   var output = [];
 
   for (var i = 0; i < array.length; i += 1) {
-    var value = toText_(array[i]);
+    var value = normalizeImageUrl_(array[i]);
     if (!value) {
       continue;
     }
-    value = value.replace(/^http:\/\//i, "https://");
     if (seen[value]) {
       continue;
     }
@@ -917,6 +985,41 @@ function sanitizeUrlArray_(values, maxLen) {
   }
 
   return output;
+}
+
+function normalizeImageUrl_(value) {
+  var text = toText_(value);
+  if (!text) {
+    return "";
+  }
+
+  text = text.replace(/^http:\/\//i, "https://");
+  var driveFileId = extractDriveFileId_(text);
+  if (driveFileId) {
+    return buildDriveImageUrl_(driveFileId);
+  }
+  return text;
+}
+
+function extractDriveFileId_(url) {
+  var text = toText_(url);
+  if (!text) {
+    return "";
+  }
+
+  var patterns = [
+    /[?&]id=([a-zA-Z0-9_-]{20,})/,
+    /\/d\/([a-zA-Z0-9_-]{20,})/,
+    /\/d\/([a-zA-Z0-9_-]{20,})=/,
+  ];
+
+  for (var i = 0; i < patterns.length; i += 1) {
+    var match = text.match(patterns[i]);
+    if (match && match[1]) {
+      return match[1];
+    }
+  }
+  return "";
 }
 
 function sanitizeTextArray_(values, maxLen) {
