@@ -134,11 +134,17 @@ function handleRequest_(method, e) {
       case "addListing":
         result = addListing_(req.payload);
         break;
+      case "addListingsBatch":
+        result = addListingsBatch_(req.payload);
+        break;
       case "addInterest":
         result = addInterest_(req.payload);
         break;
       case "removeInterest":
         result = removeInterest_(req.payload);
+        break;
+      case "cancelListing":
+        result = cancelListing_(req.payload);
         break;
       case "listMyPage":
         result = listMyPage_(req.payload, req.params);
@@ -718,13 +724,62 @@ function listWishersV2_(payload, params) {
 }
 
 function addListing_(payload) {
-  var sellerId = toText_(payload.sellerId);
-  var sellerName = toText_(payload.sellerName);
-  var listing = payload.listing || {};
+  var payloadObj = payload || {};
+  var singleListing = payloadObj.listing || {};
+  var created = addListingsBatchCore_(payloadObj.sellerId, payloadObj.sellerName, [singleListing]);
+  var first = created.records[0];
 
+  return {
+    ok: true,
+    listingId: first ? toText_(first.listing_id) : "",
+    record: first ? mapListingRowToResponse_(first, {}, "") : {},
+  };
+}
+
+function addListingsBatch_(payload) {
+  var payloadObj = payload || {};
+  var listings = Array.isArray(payloadObj.listings) ? payloadObj.listings : [];
+  assert_(listings.length > 0, "listings is required");
+  if (listings.length > 20) {
+    throw new Error("listings must be 20 or less");
+  }
+
+  var created = addListingsBatchCore_(payloadObj.sellerId, payloadObj.sellerName, listings);
+  return {
+    ok: true,
+    createdCount: created.records.length,
+    listingIds: created.listingIds,
+  };
+}
+
+function addListingsBatchCore_(sellerIdRaw, sellerNameRaw, listings) {
+  var sellerId = toText_(sellerIdRaw);
+  var sellerName = toText_(sellerNameRaw);
   assert_(sellerId, "sellerId is required");
   assert_(sellerName, "sellerName is required");
 
+  var records = [];
+  for (var i = 0; i < listings.length; i += 1) {
+    records.push(buildListingRecordFromPayload_(listings[i] || {}, sellerId, sellerName));
+  }
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
+  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+  appendObjectRows_(sheet, LISTINGS_HEADERS, records);
+  invalidateMarketplaceCache_();
+
+  var listingIds = [];
+  for (var j = 0; j < records.length; j += 1) {
+    listingIds.push(toText_(records[j].listing_id));
+  }
+
+  return {
+    records: records,
+    listingIds: listingIds,
+  };
+}
+
+function buildListingRecordFromPayload_(listing, sellerId, sellerName) {
   var itemType = normalizeItemType_(listing.itemType);
   var category = toText_(listing.category) || defaultCategoryByItemType_(itemType);
   var title = toText_(listing.title);
@@ -733,7 +788,6 @@ function addListing_(payload) {
 
   assert_(title, "title is required");
   assert_(category, "category is required");
-
   if (jan && !isValidBookJan_(jan)) {
     throw new Error("invalid jan");
   }
@@ -741,7 +795,7 @@ function addListing_(payload) {
   var imageUrls = sanitizeUrlArray_(listing.imageUrls, 5);
   var subjectTags = itemType === "book" ? sanitizeTextArray_(listing.subjectTags, 20) : [];
 
-  var record = {
+  return {
     created_at: new Date().toISOString(),
     listing_id: createId_("listing"),
     item_type: itemType,
@@ -757,15 +811,6 @@ function addListing_(payload) {
     seller_name: sellerName,
     seller_id: sellerId,
     status: DEFAULT_STATUS,
-  };
-
-  appendObjectRowByName_(LISTINGS_SHEET_NAME, LISTINGS_HEADERS, record);
-  invalidateMarketplaceCache_();
-
-  return {
-    ok: true,
-    listingId: record.listing_id,
-    record: mapListingRowToResponse_(record, {}, ""),
   };
 }
 
@@ -850,6 +895,86 @@ function removeInterest_(payload) {
     removed: rowsToDelete.length > 0,
     removedCount: rowsToDelete.length,
   };
+}
+
+function cancelListing_(payload) {
+  var payloadObj = payload || {};
+  var sellerId = toText_(payloadObj.sellerId);
+  var listingId = toText_(payloadObj.listingId);
+  assert_(sellerId, "sellerId is required");
+  assert_(listingId, "listingId is required");
+
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
+  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+  if (sheet.getLastRow() <= 1) {
+    throw new Error("listing not found");
+  }
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, LISTINGS_HEADERS.length).getValues();
+  var rowToUpdate = 0;
+  var statusIndex = LISTINGS_HEADERS.indexOf("status");
+  var sellerIndex = LISTINGS_HEADERS.indexOf("seller_id");
+  var listingIndex = LISTINGS_HEADERS.indexOf("listing_id");
+
+  for (var i = 0; i < values.length; i += 1) {
+    var rowListingId = toText_(values[i][listingIndex]);
+    if (rowListingId !== listingId) {
+      continue;
+    }
+
+    var rowSellerId = toText_(values[i][sellerIndex]);
+    if (rowSellerId !== sellerId) {
+      throw new Error("only seller can cancel listing");
+    }
+
+    var rowStatus = toText_(values[i][statusIndex]) || DEFAULT_STATUS;
+    if (rowStatus !== DEFAULT_STATUS) {
+      return {
+        ok: true,
+        cancelled: false,
+        listingId: listingId,
+      };
+    }
+
+    rowToUpdate = i + 2;
+    break;
+  }
+
+  if (!rowToUpdate) {
+    throw new Error("listing not found");
+  }
+
+  sheet.getRange(rowToUpdate, statusIndex + 1).setValue("CANCELLED");
+  removeInterestsByListingId_(listingId);
+  invalidateMarketplaceCache_();
+
+  return {
+    ok: true,
+    cancelled: true,
+    listingId: listingId,
+  };
+}
+
+function removeInterestsByListingId_(listingId) {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTERESTS_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return 0;
+  }
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, INTERESTS_HEADERS.length).getValues();
+  var rowsToDelete = [];
+
+  for (var i = 0; i < values.length; i += 1) {
+    var rowListingId = toText_(values[i][2]);
+    if (rowListingId === listingId) {
+      rowsToDelete.push(i + 2);
+    }
+  }
+
+  for (var j = rowsToDelete.length - 1; j >= 0; j -= 1) {
+    sheet.deleteRow(rowsToDelete[j]);
+  }
+  return rowsToDelete.length;
 }
 
 function listMyPage_(payload, params) {

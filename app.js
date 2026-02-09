@@ -46,6 +46,7 @@ import "./config.js";
   const LISTINGS_PAGE_SIZE = 80;
   const LISTINGS_PAGE_MAX = 20;
   const MAX_UPLOAD_IMAGES = 5;
+  const MAX_BATCH_LISTINGS = 20;
   const MAX_UPLOAD_FILE_BYTES = 8 * 1024 * 1024;
   const IMAGE_UPLOAD_CONCURRENCY = 3;
   const UPLOAD_MAX_EDGE = 1800;
@@ -78,6 +79,7 @@ import "./config.js";
     seller: {
       currentBookMeta: null,
       currentJan: "",
+      draftQueue: [],
     },
   };
 
@@ -114,6 +116,11 @@ import "./config.js";
     subjectFreeInput: byId("subjectFreeInput"),
     imageInput: byId("imageInput"),
     imagePreview: byId("imagePreview"),
+    queueListingButton: byId("queueListingButton"),
+    submitQueuedListingsButton: byId("submitQueuedListingsButton"),
+    queuedListingsSection: byId("queuedListingsSection"),
+    queuedListingsList: byId("queuedListingsList"),
+    queuedListingsEmpty: byId("queuedListingsEmpty"),
     submitListingButton: byId("submitListingButton"),
     listingStatus: byId("listingStatus"),
 
@@ -169,6 +176,7 @@ import "./config.js";
   function initialize() {
     ensureRequiredDom();
     bindEvents();
+    renderQueuedListings();
     renderSessionState();
     switchTab(state.activeTab, { persist: false });
     queueSubjectTagsRender();
@@ -187,6 +195,9 @@ import "./config.js";
       "myScreen",
       "listingGrid",
       "listingForm",
+      "queueListingButton",
+      "submitQueuedListingsButton",
+      "queuedListingsList",
       "myConflictSection",
       "loginModal",
       "wishersModal",
@@ -263,6 +274,9 @@ import "./config.js";
 
     dom.imageInput.addEventListener("change", handleImagePreview);
     dom.listingForm.addEventListener("submit", handleSubmitListing);
+    dom.queueListingButton.addEventListener("click", handleQueueListing);
+    dom.submitQueuedListingsButton.addEventListener("click", handleSubmitQueuedListings);
+    dom.queuedListingsList.addEventListener("click", handleQueueActionClick);
 
     dom.reloadMyPageButton.addEventListener("click", () => {
       if (!state.session) {
@@ -403,6 +417,8 @@ import "./config.js";
     }
 
     dom.submitListingButton.disabled = !canPost;
+    dom.queueListingButton.disabled = !canPost;
+    dom.submitQueuedListingsButton.disabled = !canPost || !state.seller.draftQueue.length;
     dom.myConflictSection.classList.toggle("hidden", !canViewConflictSection());
   }
 
@@ -530,8 +546,10 @@ import "./config.js";
     state.detailCache = {};
     state.requests.detailByListingId = {};
     state.requests.wishersByListingId = {};
+    state.seller.draftQueue = [];
     clearSession();
     renderSessionState();
+    renderQueuedListings();
     renderMyPage([], [], []);
     closeWishersModal();
     closeDetailModal();
@@ -956,6 +974,11 @@ import "./config.js";
       return;
     }
 
+    if (action === "cancel-listing") {
+      await cancelListing(listing);
+      return;
+    }
+
     if (action === "show-wishers") {
       await openWishersModal(listing);
     }
@@ -1038,6 +1061,52 @@ import "./config.js";
 
     await refreshListings();
     await loadListingDetail(listing.listingId, { forceRefresh: true });
+  }
+
+  async function cancelListing(listing) {
+    if (!state.session) {
+      openLoginModal();
+      return;
+    }
+    if (normalizeText(listing.sellerId) !== normalizeText(state.session.userId)) {
+      setStatus(dom.myStatus, "自分の出品のみ取消できます。", "error");
+      return;
+    }
+    const confirmed = window.confirm(`「${listing.title || "この商品"}」の出品を取り消しますか？`);
+    if (!confirmed) {
+      return;
+    }
+
+    setStatus(dom.myStatus, "出品取消中...");
+    const result = await apiPost(
+      "cancelListing",
+      {
+        sellerId: state.session.userId,
+        listingId: listing.listingId,
+      },
+      60000,
+      1
+    );
+
+    if (!result.ok) {
+      setStatus(dom.myStatus, result.error || "出品取消に失敗しました。", "error");
+      return;
+    }
+
+    if (result.cancelled === false) {
+      setStatus(dom.myStatus, "この出品は既に取り消されています。", "ok");
+      await refreshListings();
+      await refreshMyPage();
+      return;
+    }
+
+    if (state.detailListingId === listing.listingId) {
+      closeDetailModal();
+    }
+    delete state.detailCache[listing.listingId];
+    await refreshListings();
+    await refreshMyPage();
+    setStatus(dom.myStatus, "出品を取り消しました。", "ok");
   }
 
   async function openWishersModal(listing) {
@@ -1282,70 +1351,12 @@ import "./config.js";
       return;
     }
 
-    const itemType = normalizeItemType(dom.itemTypeInput.value);
-    const category = normalizeText(dom.categoryInput.value) || defaultCategory(itemType);
-    const title = normalizeText(dom.titleInput.value);
-    const description = normalizeText(dom.descriptionInput.value);
-
-    if (!category) {
-      setStatus(dom.listingStatus, "カテゴリを入力してください。", "error");
-      return;
-    }
-    if (!title) {
-      setStatus(dom.listingStatus, "タイトルを入力してください。", "error");
-      return;
-    }
-
-    dom.submitListingButton.disabled = true;
-
+    setListingActionBusy(true);
     try {
-      let jan = "";
-      let author = "";
-      let publisher = "";
-      let publishedDate = "";
-      let subjectTags = [];
-      let fallbackCoverUrl = "";
-
-      if (itemType === "book") {
-        jan = normalizeJan(dom.janInput.value);
-        if (jan && !isJanBookCode(jan)) {
-          throw new Error("JAN/ISBN-13 が正しくありません。");
-        }
-
-        const activeBookMeta =
-          jan && state.seller.currentBookMeta && state.seller.currentJan === jan ? state.seller.currentBookMeta : null;
-        if (activeBookMeta) {
-          fallbackCoverUrl = normalizeText(activeBookMeta.coverUrl || activeBookMeta.coverCandidates?.[0]);
-        }
-
-        author = normalizeText(dom.authorInput.value) || normalizeText(activeBookMeta?.author);
-        publisher = normalizeText(dom.publisherInput.value) || normalizeText(activeBookMeta?.publisher);
-        publishedDate =
-          normalizeText(dom.publishedDateInput.value) || normalizeText(activeBookMeta?.publishedDate);
-        subjectTags = collectSubjectTags();
-      }
-
-      const payloads = await buildUploadPayloads(dom.imageInput.files);
-      const imageUrls = await uploadImagePayloads(payloads);
-
-      if (!imageUrls.length && fallbackCoverUrl) {
-        imageUrls.push(fallbackCoverUrl);
-      }
-
-      const listing = {
-        itemType,
-        category,
-        title,
-        description,
-        imageUrls,
-        jan,
-        subjectTags,
-        author,
-        publisher,
-        publishedDate,
-      };
-
+      const draft = await buildListingDraftFromForm();
+      const listing = await materializeListingFromDraft(draft, 1, 1);
       setStatus(dom.listingStatus, "出品を登録中...");
+
       const result = await apiPost(
         "addListing",
         {
@@ -1353,7 +1364,7 @@ import "./config.js";
           sellerName: state.session.name,
           listing,
         },
-        60000,
+        90000,
         1
       );
 
@@ -1361,22 +1372,245 @@ import "./config.js";
         throw new Error(result.error || "出品登録に失敗しました。");
       }
 
-      dom.listingForm.reset();
-      clearPreviewObjectUrls();
-      dom.imagePreview.innerHTML = "";
-      state.seller.currentBookMeta = null;
-      state.seller.currentJan = "";
-      syncBookFieldVisibility();
-      setStatus(dom.lookupStatus, "");
+      resetListingFormInputs();
       setStatus(dom.listingStatus, "出品しました。", "ok");
-
       switchTab("home");
       await refreshListings();
     } catch (error) {
       setStatus(dom.listingStatus, String(error.message || error), "error");
     } finally {
+      setListingActionBusy(false);
       applyAccessState();
     }
+  }
+
+  async function handleQueueListing() {
+    if (!state.session) {
+      openLoginModal();
+      return;
+    }
+    if (!canCreateListing()) {
+      setStatus(dom.listingStatus, "出品するにはログインしてください。", "error");
+      return;
+    }
+    if (state.seller.draftQueue.length >= MAX_BATCH_LISTINGS) {
+      setStatus(dom.listingStatus, `一括出品は最大${MAX_BATCH_LISTINGS}件までです。`, "error");
+      return;
+    }
+
+    setListingActionBusy(true);
+    try {
+      const draft = await buildListingDraftFromForm();
+      state.seller.draftQueue.push(draft);
+      renderQueuedListings();
+      resetListingFormInputs();
+      setStatus(dom.listingStatus, `${state.seller.draftQueue.length}件を一括出品リストに追加しました。`, "ok");
+    } catch (error) {
+      setStatus(dom.listingStatus, String(error.message || error), "error");
+    } finally {
+      setListingActionBusy(false);
+      applyAccessState();
+    }
+  }
+
+  async function handleSubmitQueuedListings() {
+    if (!state.session) {
+      openLoginModal();
+      return;
+    }
+    if (!state.seller.draftQueue.length) {
+      setStatus(dom.listingStatus, "一括出品リストが空です。", "error");
+      return;
+    }
+
+    setListingActionBusy(true);
+    try {
+      const drafts = state.seller.draftQueue.slice();
+      const listings = [];
+      for (let i = 0; i < drafts.length; i += 1) {
+        setStatus(dom.listingStatus, `一括出品の準備中 (${i + 1}/${drafts.length}) ...`);
+        const listing = await materializeListingFromDraft(drafts[i], i + 1, drafts.length);
+        listings.push(listing);
+      }
+
+      setStatus(dom.listingStatus, `一括出品を登録中 (${listings.length}件) ...`);
+      const result = await apiPost(
+        "addListingsBatch",
+        {
+          sellerId: state.session.userId,
+          sellerName: state.session.name,
+          listings,
+        },
+        180000,
+        1
+      );
+
+      if (!result.ok) {
+        throw new Error(result.error || "一括出品に失敗しました。");
+      }
+
+      state.seller.draftQueue = [];
+      renderQueuedListings();
+      setStatus(dom.listingStatus, `${Number(result.createdCount || listings.length)}件を出品しました。`, "ok");
+      switchTab("home");
+      await refreshListings();
+      if (state.activeTab === "my") {
+        await refreshMyPage();
+      }
+    } catch (error) {
+      setStatus(dom.listingStatus, String(error.message || error), "error");
+    } finally {
+      setListingActionBusy(false);
+      applyAccessState();
+    }
+  }
+
+  function handleQueueActionClick(event) {
+    const button = event.target.closest("button[data-action='remove-draft'][data-draft-id]");
+    if (!button) {
+      return;
+    }
+    const draftId = normalizeText(button.dataset.draftId);
+    state.seller.draftQueue = state.seller.draftQueue.filter((draft) => draft.draftId !== draftId);
+    renderQueuedListings();
+    applyAccessState();
+  }
+
+  function renderQueuedListings() {
+    dom.queuedListingsList.innerHTML = "";
+    const drafts = Array.isArray(state.seller.draftQueue) ? state.seller.draftQueue : [];
+    if (!drafts.length) {
+      dom.queuedListingsEmpty.classList.remove("hidden");
+      dom.submitQueuedListingsButton.textContent = "まとめて出品する";
+      return;
+    }
+
+    dom.queuedListingsEmpty.classList.add("hidden");
+    drafts.forEach((draft, index) => {
+      const item = document.createElement("article");
+      item.className = "stack-item";
+
+      const head = document.createElement("div");
+      head.className = "stack-head";
+
+      const title = document.createElement("h4");
+      title.textContent = `${index + 1}. ${draft.listing.title || "タイトル未設定"}`;
+
+      const removeButton = document.createElement("button");
+      removeButton.type = "button";
+      removeButton.className = "action-btn";
+      removeButton.dataset.action = "remove-draft";
+      removeButton.dataset.draftId = draft.draftId;
+      removeButton.textContent = "削除";
+
+      head.appendChild(title);
+      head.appendChild(removeButton);
+
+      const meta = document.createElement("p");
+      meta.className = "muted queued-listing-meta";
+      meta.textContent = [
+        draft.listing.itemType === "book" ? "本" : listingTypeLabel(draft.listing.itemType),
+        draft.listing.category || "カテゴリなし",
+        `画像${draft.imagePayloads.length}枚`,
+      ]
+        .filter(Boolean)
+        .join(" / ");
+
+      item.appendChild(head);
+      item.appendChild(meta);
+      dom.queuedListingsList.appendChild(item);
+    });
+
+    dom.submitQueuedListingsButton.textContent = `まとめて出品する (${drafts.length}件)`;
+  }
+
+  async function buildListingDraftFromForm() {
+    const itemType = normalizeItemType(dom.itemTypeInput.value);
+    const category = normalizeText(dom.categoryInput.value) || defaultCategory(itemType);
+    const title = normalizeText(dom.titleInput.value);
+    const description = normalizeText(dom.descriptionInput.value);
+
+    if (!category) {
+      throw new Error("カテゴリを入力してください。");
+    }
+    if (!title) {
+      throw new Error("タイトルを入力してください。");
+    }
+
+    let jan = "";
+    let author = "";
+    let publisher = "";
+    let publishedDate = "";
+    let subjectTags = [];
+    let fallbackCoverUrl = "";
+
+    if (itemType === "book") {
+      jan = normalizeJan(dom.janInput.value);
+      if (jan && !isJanBookCode(jan)) {
+        throw new Error("JAN/ISBN-13 が正しくありません。");
+      }
+
+      const activeBookMeta =
+        jan && state.seller.currentBookMeta && state.seller.currentJan === jan ? state.seller.currentBookMeta : null;
+      if (activeBookMeta) {
+        fallbackCoverUrl = normalizeText(activeBookMeta.coverUrl || activeBookMeta.coverCandidates?.[0]);
+      }
+
+      author = normalizeText(dom.authorInput.value) || normalizeText(activeBookMeta?.author);
+      publisher = normalizeText(dom.publisherInput.value) || normalizeText(activeBookMeta?.publisher);
+      publishedDate = normalizeText(dom.publishedDateInput.value) || normalizeText(activeBookMeta?.publishedDate);
+      subjectTags = collectSubjectTags();
+    }
+
+    const imagePayloads = await buildUploadPayloads(dom.imageInput.files);
+
+    return {
+      draftId: `draft-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      listing: {
+        itemType,
+        category,
+        title,
+        description,
+        jan,
+        subjectTags,
+        author,
+        publisher,
+        publishedDate,
+      },
+      imagePayloads,
+      fallbackCoverUrl,
+    };
+  }
+
+  async function materializeListingFromDraft(draft, index, total) {
+    const payloads = Array.isArray(draft.imagePayloads) ? draft.imagePayloads : [];
+    if (payloads.length) {
+      setStatus(dom.listingStatus, `画像アップロード中 (${index}/${total}) ...`);
+    }
+    const imageUrls = await uploadImagePayloads(payloads);
+    if (!imageUrls.length && draft.fallbackCoverUrl) {
+      imageUrls.push(draft.fallbackCoverUrl);
+    }
+    return {
+      ...draft.listing,
+      imageUrls,
+    };
+  }
+
+  function resetListingFormInputs() {
+    dom.listingForm.reset();
+    clearPreviewObjectUrls();
+    dom.imagePreview.innerHTML = "";
+    state.seller.currentBookMeta = null;
+    state.seller.currentJan = "";
+    setStatus(dom.lookupStatus, "");
+    syncBookFieldVisibility();
+  }
+
+  function setListingActionBusy(isBusy) {
+    dom.submitListingButton.disabled = isBusy;
+    dom.queueListingButton.disabled = isBusy;
+    dom.submitQueuedListingsButton.disabled = isBusy || !state.seller.draftQueue.length;
   }
 
   function clearPreviewObjectUrls() {
@@ -1482,6 +1716,11 @@ import "./config.js";
           {
             action: "show-wishers",
             label: `欲しい人 ${Number(listing.wantedCount || 0)}名`,
+            className: "action-btn",
+          },
+          {
+            action: "cancel-listing",
+            label: "出品取消",
             className: "action-btn",
           },
         ]));

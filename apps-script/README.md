@@ -79,6 +79,33 @@ request:
 }
 ```
 
+### POST `action=addListingsBatch`
+request:
+```json
+{
+  "sellerId": "resident_105",
+  "sellerName": "坪田　晴琉",
+  "listings": [
+    {
+      "itemType": "goods",
+      "category": "生活用品",
+      "title": "延長コード",
+      "description": "使用1年",
+      "imageUrls": ["https://..."]
+    },
+    {
+      "itemType": "book",
+      "category": "書籍",
+      "title": "力学",
+      "description": "",
+      "imageUrls": [],
+      "jan": "9784410105784",
+      "subjectTags": ["物理"]
+    }
+  ]
+}
+```
+
 ### POST `action=addInterest`
 request:
 ```json
@@ -89,6 +116,12 @@ request:
 request:
 ```json
 { "viewerId": "resident_105", "listingId": "listing_xxx" }
+```
+
+### POST `action=cancelListing`
+request:
+```json
+{ "sellerId": "resident_105", "listingId": "listing_xxx" }
 ```
 
 ### GET `action=listMyPage&viewerId=resident_105`

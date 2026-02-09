@@ -460,6 +460,22 @@ button:focus-visible {
   border: 1px solid var(--line);
 }
 
+.batch-tools {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.queued-section {
+  margin-top: 4px;
+}
+
+.queued-listing-meta {
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
 .submit-btn {
   border-radius: var(--radius-sm);
   padding: 12px 14px;
