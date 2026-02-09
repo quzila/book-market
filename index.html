@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>寮内ゆずりあいマーケット</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=M+PLUS+1p:wght@400;500;700&family=Outfit:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="hero-head">
+        <div class="session-row">
+          <p id="sessionBadge" class="session-badge">未ログイン</p>
+          <div class="session-actions">
+            <button id="openLoginButton" class="plain-btn" type="button">ログイン</button>
+            <button id="logoutButton" class="plain-btn hidden" type="button">ログアウト</button>
+          </div>
+        </div>
+
+        <label class="search-pill" aria-label="検索">
+          <span class="icon">🔍</span>
+          <input id="searchInput" type="search" placeholder="検索を開始" />
+        </label>
+
+        <div id="quickCategoryRow" class="quick-categories" role="tablist" aria-label="カテゴリ">
+          <button type="button" class="quick-chip is-active" data-category="">
+            <span class="emoji">🏷️</span>
+            <span>すべて</span>
+          </button>
+          <button type="button" class="quick-chip" data-category="book">
+            <span class="emoji">📚</span>
+            <span>書籍</span>
+          </button>
+          <button type="button" class="quick-chip" data-category="goods">
+            <span class="emoji">🧩</span>
+            <span>小物</span>
+          </button>
+          <button type="button" class="quick-chip" data-category="bicycle">
+            <span class="emoji">🚲</span>
+            <span>自転車</span>
+          </button>
+          <button type="button" class="quick-chip" data-category="other">
+            <span class="emoji">🛎️</span>
+            <span>その他</span>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section id="homeScreen" class="screen is-active">
+          <section class="feed-section">
+            <div class="section-head">
+              <h2>商品一覧</h2>
+              <button id="reloadButton" class="circle-btn" type="button" aria-label="再読み込み">→</button>
+            </div>
+            <div id="listingGrid" class="listing-grid"></div>
+          </section>
+
+          <p id="homeStatus" class="status"></p>
+        </section>
+
+        <section id="plusScreen" class="screen hidden">
+          <article class="panel-card">
+            <div class="section-head">
+              <h2>商品を出品</h2>
+            </div>
+            <p class="muted">本・小物・自転車を登録できます。画像は1〜5枚までです。</p>
+            <p id="plusLocked" class="notice hidden">出品するにはログインしてください。</p>
+
+            <form id="listingForm" class="listing-form" novalidate>
+              <div class="field-grid two">
+                <label class="field">
+                  <span>商品種別</span>
+                  <select id="itemTypeInput" required>
+                    <option value="book">本</option>
+                    <option value="goods">小物</option>
+                    <option value="bicycle">自転車</option>
+                    <option value="other">その他</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>カテゴリ（自由入力）</span>
+                  <input id="categoryInput" maxlength="32" placeholder="例: 教科書 / 生活用品 / 自転車" required />
+                </label>
+              </div>
+
+              <label class="field">
+                <span>タイトル</span>
+                <input id="titleInput" maxlength="100" placeholder="例: 線形代数入門 / クロスバイク" required />
+              </label>
+
+              <label class="field">
+                <span>説明</span>
+                <textarea id="descriptionInput" rows="4" maxlength="1200" placeholder="状態や注意点を入力"></textarea>
+              </label>
+
+              <div id="bookFields" class="book-fields">
+                <div class="field-grid two align-end">
+                  <label class="field">
+                    <span>JAN / ISBN-13（本のみ）</span>
+                    <input id="janInput" inputmode="numeric" placeholder="978xxxxxxxxxx" />
+                  </label>
+                  <button id="lookupBookButton" class="plain-btn accent" type="button">書誌を取得</button>
+                </div>
+                <p id="lookupStatus" class="status"></p>
+
+                <div class="field-grid three">
+                  <label class="field">
+                    <span>著者</span>
+                    <input id="authorInput" maxlength="120" />
+                  </label>
+                  <label class="field">
+                    <span>出版社</span>
+                    <input id="publisherInput" maxlength="120" />
+                  </label>
+                  <label class="field">
+                    <span>出版日</span>
+                    <input id="publishedDateInput" maxlength="40" placeholder="YYYY-MM-DD" />
+                  </label>
+                </div>
+
+                <label class="field">
+                  <span>科目タグ（複数可）</span>
+                  <div id="subjectTags" class="subject-tags"></div>
+                </label>
+
+                <label class="field">
+                  <span>科目タグ（自由入力, カンマ区切り）</span>
+                  <input id="subjectFreeInput" placeholder="例: 統計学, 実験, 設計" />
+                </label>
+              </div>
+
+              <label class="field">
+                <span>画像（1〜5枚）</span>
+                <input id="imageInput" type="file" accept="image/*" capture="environment" multiple />
+              </label>
+              <div id="imagePreview" class="image-preview"></div>
+
+              <p id="listingStatus" class="status"></p>
+              <button id="submitListingButton" class="submit-btn" type="submit">出品する</button>
+            </form>
+          </article>
+        </section>
+
+        <section id="myScreen" class="screen hidden">
+          <article class="panel-card">
+            <div class="section-head">
+              <h2>マイページ</h2>
+              <button id="reloadMyPageButton" class="circle-btn" type="button" aria-label="更新">→</button>
+            </div>
+            <p id="myLocked" class="notice hidden">マイページを見るにはログインしてください。</p>
+            <p id="myStatus" class="status"></p>
+
+            <section class="stack-section">
+              <h3>欲しいにした商品</h3>
+              <div id="myWantedList" class="stack-list"></div>
+              <p id="myWantedEmpty" class="muted hidden">まだありません。</p>
+            </section>
+
+            <section class="stack-section">
+              <h3>自分の出品</h3>
+              <div id="myListingsList" class="stack-list"></div>
+              <p id="myListingsEmpty" class="muted hidden">まだありません。</p>
+            </section>
+
+            <section id="myConflictSection" class="stack-section">
+              <h3>希望者がいる商品</h3>
+              <div id="myConflictList" class="stack-list"></div>
+              <p id="myConflictEmpty" class="muted hidden">まだ希望者データはありません。</p>
+            </section>
+          </article>
+        </section>
+
+      </main>
+
+      <nav id="bottomNav" class="bottom-nav" aria-label="メインメニュー">
+        <button class="nav-item is-active" data-tab="home" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.35-4.35"></path></svg>
+          <small>ホーム</small>
+        </button>
+        <button class="nav-item center" data-tab="plus" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+          <small>出品</small>
+        </button>
+        <button class="nav-item" data-tab="my" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+          <small>マイページ</small>
+        </button>
+      </nav>
+    </div>
+
+    <div id="loginModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="loginHeading">
+      <div class="modal-card">
+        <h2 id="loginHeading">ログイン</h2>
+        <p class="muted">部屋番号を入力して名前を確認します。</p>
+
+        <label class="field">
+          <span>部屋番号</span>
+          <input id="roomNumberInput" inputmode="numeric" placeholder="例: 105" maxlength="3" />
+        </label>
+
+        <div id="nameConfirmBox" class="confirm-box hidden">
+          <p>該当者: <strong id="confirmName">-</strong></p>
+        </div>
+
+        <p id="loginStatus" class="status"></p>
+
+        <div class="modal-actions">
+          <button id="checkRoomButton" class="plain-btn accent" type="button">名前を確認</button>
+          <button id="confirmLoginButton" class="plain-btn accent hidden" type="button">この名前でログイン</button>
+          <button id="closeLoginButton" class="plain-btn" type="button">閉じる</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="wishersModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="wishersHeading">
+      <div class="modal-card">
+        <h2 id="wishersHeading">欲しい人リスト</h2>
+        <p id="wishersTitle" class="muted">-</p>
+        <ul id="wishersList" class="wishers-list"></ul>
+        <p id="wishersStatus" class="status"></p>
+        <div class="modal-actions">
+          <button id="closeWishersButton" class="plain-btn" type="button">閉じる</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="detailModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="detailHeading">
+      <div class="modal-card detail-card">
+        <div class="section-head">
+          <h2 id="detailHeading">商品詳細</h2>
+          <button id="closeDetailButton" class="plain-btn" type="button">閉じる</button>
+        </div>
+        <img id="detailImage" class="detail-image" alt="商品画像" />
+        <h3 id="detailTitle">-</h3>
+        <p id="detailMeta" class="muted">-</p>
+        <div id="detailTags" class="tag-row"></div>
+        <p id="detailDescription" class="muted">-</p>
+        <p id="detailStatus" class="status"></p>
+        <div class="modal-actions">
+          <button id="detailWantButton" class="plain-btn accent" type="button" data-action="toggle-want">欲しい</button>
+          <button id="detailWishersButton" class="plain-btn" type="button" data-action="show-wishers">欲しい人 0名</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="./config.js"></script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
