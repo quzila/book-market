@@ -30,7 +30,19 @@
 `created_at, listing_id, item_type, category, title, description, image_urls_json, jan, subject_tags_json, author, publisher, published_date, seller_name, seller_id, status`
 
 ### `interests`
-`created_at, interest_id, listing_id, viewer_id, viewer_name`
+`created_at, interest_id, listing_id, viewer_id, viewer_name, is_active`
+
+### `listings_projection`
+`projection_row_id, created_at, listing_id, item_type, category, title, thumb_url, detail_image_url, jan, subject_tags_json, author, publisher, seller_name, seller_id, status, is_active, wanted_count, wanted_viewer_ids_json, updated_at`
+
+### `listing_index`
+`listing_id, listings_row, projection_row`
+
+### `interest_index`
+`interest_key, interests_row, is_active`
+
+### `runtime_meta`
+`key, value`
 
 ## 7. API
 ### POST `action=loginByRoom`
@@ -47,9 +59,22 @@ request:
 - レスポンスに `version` を含む（クライアント側のキャッシュ判定用）。
 - `nextCursor` が空文字の場合、次ページなし。
 
+### GET `action=listListingsV3&viewerId=...&limit=80&cursor=0`
+- `listings_projection` を直接読む高速版API。
+- `cursor` は「新しい順の有効データオフセット」。
+- レスポンス形式は `listListingsV2` と互換。
+
 ### GET `action=getListingsVersion`
 - 一覧スナップショットの `version` と `totalCount` を返す軽量API。
 - クライアントは `version` が同じ場合に一覧再取得をスキップできる。
+
+### POST/GET `action=rebuildProjection`
+- `listings / interests` から `listings_projection` と各 index を再構築する管理API。
+- 可能な場合は Advanced Sheets API `batchGet` を使って1RPCで読込。
+
+### GET `action=getProjectionHealth`
+- 投影状態を確認する管理API。
+- `version`, `lastRebuildAt`, `dirty`, `rowCounts` を返す。
 
 ### GET `action=getListingDetailV2&listingId=...&viewerId=...`
 - 商品詳細を遅延取得するAPI。
@@ -145,17 +170,20 @@ request:
 ```json
 { "viewerId": "resident_105", "listingId": "listing_xxx" }
 ```
+- 物理削除せず `is_active=0` の論理削除を行う。
 
 ### POST `action=cancelListing`
 request:
 ```json
 { "sellerId": "resident_105", "listingId": "listing_xxx" }
 ```
+- 対象出品を `CANCELLED` に変更し、関連interestを論理削除する。
 
 ### GET `action=listMyPage&viewerId=resident_105`
 
 ## 8. 権限について
 - `uploadImage` は Google Drive にファイルを保存するため、初回実行時に Drive 権限を承認する。
+- `rebuildProjection` で `batchGet` を使う場合は Apps Script の Advanced Google Services で Sheets API を有効化する。
 
 ## 9. GitHub Pages 公開
 1. `/Users/tatsuru/Desktop/book` を GitHub に push。

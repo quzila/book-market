@@ -1,5 +1,9 @@
 var LISTINGS_SHEET_NAME = "listings";
 var INTERESTS_SHEET_NAME = "interests";
+var LISTINGS_PROJECTION_SHEET_NAME = "listings_projection";
+var LISTING_INDEX_SHEET_NAME = "listing_index";
+var INTEREST_INDEX_SHEET_NAME = "interest_index";
+var RUNTIME_META_SHEET_NAME = "runtime_meta";
 var LEGACY_BOOKS_SHEET_NAME = "books";
 
 var LISTINGS_HEADERS = [
@@ -20,7 +24,34 @@ var LISTINGS_HEADERS = [
   "status",
 ];
 
-var INTERESTS_HEADERS = ["created_at", "interest_id", "listing_id", "viewer_id", "viewer_name"];
+var INTERESTS_HEADERS = ["created_at", "interest_id", "listing_id", "viewer_id", "viewer_name", "is_active"];
+var INTERESTS_HEADERS_V1 = ["created_at", "interest_id", "listing_id", "viewer_id", "viewer_name"];
+
+var LISTINGS_PROJECTION_HEADERS = [
+  "projection_row_id",
+  "created_at",
+  "listing_id",
+  "item_type",
+  "category",
+  "title",
+  "thumb_url",
+  "detail_image_url",
+  "jan",
+  "subject_tags_json",
+  "author",
+  "publisher",
+  "seller_name",
+  "seller_id",
+  "status",
+  "is_active",
+  "wanted_count",
+  "wanted_viewer_ids_json",
+  "updated_at",
+];
+
+var LISTING_INDEX_HEADERS = ["listing_id", "listings_row", "projection_row"];
+var INTEREST_INDEX_HEADERS = ["interest_key", "interests_row", "is_active"];
+var RUNTIME_META_HEADERS = ["key", "value"];
 
 var LEGACY_BOOK_HEADERS = [
   "created_at",
@@ -40,15 +71,24 @@ var LEGACY_BOOK_HEADERS = [
 var LEGACY_INTEREST_HEADERS = ["created_at", "interest_id", "book_id", "jan", "viewer_id", "viewer_name"];
 
 var DEFAULT_STATUS = "AVAILABLE";
+var ACTIVE_FLAG_ON = "1";
+var ACTIVE_FLAG_OFF = "0";
 var UPLOAD_FOLDER_ID = "";
 var MARKET_SNAPSHOT_CACHE_KEY = "market_snapshot_v2";
 var MARKET_SNAPSHOT_TTL_SEC = 60;
-var SCHEMA_CACHE_KEY = "market_schema_ok_v2";
+var SCHEMA_CACHE_KEY = "market_schema_ok_v3";
 var SCHEMA_CACHE_TTL_SEC = 3600;
 var MARKET_COMPUTE_VERSION_PROPERTY = "market_compute_version_v1";
 var MARKET_COMPUTE_CACHE_TTL_SEC = 60;
 var LISTINGS_SUMMARY_SNAPSHOT_CACHE_KEY = "listings_summary_snapshot_v1";
 var LISTINGS_SUMMARY_SNAPSHOT_CACHE_TTL_SEC = 120;
+var LISTINGS_V3_CACHE_KEY = "listings_v3";
+var LISTINGS_V3_CHUNK_MULTIPLIER = 3;
+var LISTINGS_V3_USE_FOR_V2 = true;
+var MARKET_LOCK_WAIT_MS = 20000;
+var PROJECTION_VERSION_KEY = "projection_version";
+var PROJECTION_LAST_REBUILD_KEY = "last_rebuild_at";
+var PROJECTION_DIRTY_KEY = "dirty_flag";
 
 var RESIDENTS_BY_ROOM = {
   "105": "坪田　晴琉",
@@ -82,6 +122,7 @@ var RESIDENTS_BY_ROOM = {
   "316": "森田　旺輔",
   "317": "安達　寛人",
   "318": "金川　明仁",
+  "322": "平岡　桐弥",
   "324": "松井　俊介",
   "329": "江尻　凌太朗",
 };
@@ -124,8 +165,17 @@ function handleRequest_(method, e) {
       case "listListingsV2":
         result = listListingsV2_(req.payload, req.params);
         break;
+      case "listListingsV3":
+        result = listListingsV3_(req.payload, req.params);
+        break;
       case "getListingsVersion":
         result = getListingsVersion_(req.payload, req.params);
+        break;
+      case "rebuildProjection":
+        result = rebuildProjection_(req.payload, req.params);
+        break;
+      case "getProjectionHealth":
+        result = getProjectionHealth_();
         break;
       case "getListingDetailV2":
         result = getListingDetailV2_(req.payload, req.params);
@@ -258,8 +308,37 @@ function ensureSchema_() {
   }
   ensureSheetWithHeaderMigration_(interestsSheet, INTERESTS_HEADERS, "interests");
 
+  var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  if (!projectionSheet) {
+    projectionSheet = ss.insertSheet(LISTINGS_PROJECTION_SHEET_NAME);
+  }
+  ensureSheetWithHeaderMigration_(projectionSheet, LISTINGS_PROJECTION_HEADERS, "projection");
+
+  var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+  if (!listingIndexSheet) {
+    listingIndexSheet = ss.insertSheet(LISTING_INDEX_SHEET_NAME);
+  }
+  ensureSheetWithHeaderMigration_(listingIndexSheet, LISTING_INDEX_HEADERS, "listing_index");
+
+  var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
+  if (!interestIndexSheet) {
+    interestIndexSheet = ss.insertSheet(INTEREST_INDEX_SHEET_NAME);
+  }
+  ensureSheetWithHeaderMigration_(interestIndexSheet, INTEREST_INDEX_HEADERS, "interest_index");
+
+  var runtimeMetaSheet = ss.getSheetByName(RUNTIME_META_SHEET_NAME);
+  if (!runtimeMetaSheet) {
+    runtimeMetaSheet = ss.insertSheet(RUNTIME_META_SHEET_NAME);
+  }
+  ensureSheetWithHeaderMigration_(runtimeMetaSheet, RUNTIME_META_HEADERS, "runtime_meta");
+  ensureRuntimeMetaDefaults_(runtimeMetaSheet);
+
   migrateLegacyBooksSheetIfNeeded_(ss, listingsSheet);
   migrateLegacyInterestsSheetIfNeeded_(interestsSheet);
+
+  if (projectionSheet.getLastRow() <= 1 && listingsSheet.getLastRow() > 1) {
+    rebuildProjectionInternal_(ss, true);
+  }
   writeToCache_(SCHEMA_CACHE_KEY, "1", SCHEMA_CACHE_TTL_SEC);
 }
 
@@ -288,6 +367,7 @@ function readMarketplaceSnapshot_() {
 function invalidateMarketplaceCache_() {
   removeFromCache_(MARKET_SNAPSHOT_CACHE_KEY);
   bumpMarketComputeVersion_();
+  touchProjectionVersion_();
 }
 
 function readMarketComputeVersion_() {
@@ -412,6 +492,26 @@ function migrateLegacyInterestsSheetIfNeeded_(interestsSheet) {
     return;
   }
 
+  if (headersMatch_(headers, INTERESTS_HEADERS_V1)) {
+    var oldRows = readObjectsBySheet_(interestsSheet, INTERESTS_HEADERS_V1);
+    interestsSheet.clearContents();
+    interestsSheet.getRange(1, 1, 1, INTERESTS_HEADERS.length).setValues([INTERESTS_HEADERS]);
+    var migratedRows = [];
+    for (var o = 0; o < oldRows.length; o += 1) {
+      var oldRow = oldRows[o];
+      migratedRows.push({
+        created_at: toText_(oldRow.created_at),
+        interest_id: toText_(oldRow.interest_id) || createId_("interest"),
+        listing_id: toText_(oldRow.listing_id),
+        viewer_id: toText_(oldRow.viewer_id),
+        viewer_name: toText_(oldRow.viewer_name),
+        is_active: ACTIVE_FLAG_ON,
+      });
+    }
+    appendObjectRows_(interestsSheet, INTERESTS_HEADERS, migratedRows);
+    return;
+  }
+
   if (!headersMatch_(headers, LEGACY_INTEREST_HEADERS)) {
     backupAndResetSheet_(interestsSheet, INTERESTS_HEADERS);
     return;
@@ -430,6 +530,7 @@ function migrateLegacyInterestsSheetIfNeeded_(interestsSheet) {
       listing_id: toText_(row.book_id),
       viewer_id: toText_(row.viewer_id),
       viewer_name: toText_(row.viewer_name),
+      is_active: ACTIVE_FLAG_ON,
     });
   }
 
@@ -574,6 +675,85 @@ function listListings_(payload, params) {
 }
 
 function listListingsV2_(payload, params) {
+  if (!LISTINGS_V3_USE_FOR_V2) {
+    return listListingsV2Legacy_(payload, params);
+  }
+  return listListingsV3_(payload, params);
+}
+
+function listListingsV3_(payload, params) {
+  var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
+  var limit = parsePositiveInt_((payload && payload.limit) || (params && params.limit), 80, 1, 200);
+  var cursor = parsePositiveInt_((payload && payload.cursor) || (params && params.cursor), 0, 0, 1000000);
+  var startedAtMs = new Date().getTime();
+
+  if (isProjectionDirty_()) {
+    return listListingsV2Legacy_(payload, params);
+  }
+
+  var projectionVersion = readProjectionVersion_();
+  var cacheSuffix = [projectionVersion || "_", viewerId || "_", String(limit), String(cursor)].join("|");
+  var cached = readFromCache_(LISTINGS_V3_CACHE_KEY + ":" + cacheSuffix);
+  if (cached) {
+    try {
+      var parsedCached = JSON.parse(cached);
+      if (parsedCached && parsedCached.ok && Array.isArray(parsedCached.listings) && toText_(parsedCached.version)) {
+        return parsedCached;
+      }
+    } catch (error) {
+      // ignore broken cache value
+    }
+  }
+
+  try {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    assert_(sheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+
+    var lastRow = sheet.getLastRow();
+    if (lastRow <= 1) {
+      return {
+        ok: true,
+        version: projectionVersion || readMarketComputeVersion_(),
+        listings: [],
+        nextCursor: "",
+        totalCount: 0,
+      };
+    }
+
+    var chunkSize = Math.max(limit * LISTINGS_V3_CHUNK_MULTIPLIER, limit);
+    var pageChunk = readProjectionChunkFromTail_(sheet, cursor, chunkSize);
+    var activeCount = pageChunk.totalActive;
+    var rowsRead = pageChunk.rows.length;
+    var page = [];
+    var maxRows = Math.min(pageChunk.rows.length, limit);
+    for (var i = 0; i < maxRows; i += 1) {
+      page.push(mapProjectionRowToSummaryResponse_(pageChunk.rows[i], viewerId));
+    }
+    var nextOffset = cursor + page.length;
+
+    var response = {
+      ok: true,
+      version: projectionVersion || readMarketComputeVersion_(),
+      listings: page,
+      nextCursor: nextOffset < activeCount ? String(nextOffset) : "",
+      totalCount: activeCount,
+    };
+
+    writeToCache_(LISTINGS_V3_CACHE_KEY + ":" + cacheSuffix, JSON.stringify(response), MARKET_COMPUTE_CACHE_TTL_SEC);
+    console.log(
+      "[listListingsV3] rowsRead=%s activeTotal=%s elapsedMs=%s",
+      String(rowsRead),
+      String(activeCount),
+      String(new Date().getTime() - startedAtMs)
+    );
+    return response;
+  } catch (error) {
+    markProjectionDirty_(true);
+    return listListingsV2Legacy_(payload, params);
+  }
+}
+
+function listListingsV2Legacy_(payload, params) {
   var viewerId = toText_((payload && payload.viewerId) || (params && params.viewerId));
   var limit = parsePositiveInt_((payload && payload.limit) || (params && params.limit), 80, 1, 200);
   var cursor = parsePositiveInt_((payload && payload.cursor) || (params && params.cursor), 0, 0, 1000000);
@@ -582,9 +762,9 @@ function listListingsV2_(payload, params) {
   var cached = readComputedCache_("listings_v2", cacheSuffix);
   if (cached) {
     try {
-      var parsed = JSON.parse(cached);
-      if (parsed && parsed.ok && Array.isArray(parsed.listings) && toText_(parsed.version)) {
-        return parsed;
+      var parsedLegacy = JSON.parse(cached);
+      if (parsedLegacy && parsedLegacy.ok && Array.isArray(parsedLegacy.listings) && toText_(parsedLegacy.version)) {
+        return parsedLegacy;
       }
     } catch (error) {
       // ignore broken cache value
@@ -613,13 +793,75 @@ function listListingsV2_(payload, params) {
   return response;
 }
 
+function rebuildProjection_(payload, params) {
+  var startedAtMs = new Date().getTime();
+  var result = withMarketplaceLock_(function () {
+    var output = rebuildProjectionInternal_(SpreadsheetApp.getActiveSpreadsheet(), true);
+    markProjectionDirty_(false);
+    return output;
+  });
+
+  console.log(
+    "[rebuildProjection] listings=%s interests=%s elapsedMs=%s",
+    String(result.rowCounts.listings),
+    String(result.rowCounts.interests),
+    String(new Date().getTime() - startedAtMs)
+  );
+
+  return {
+    ok: true,
+    rebuilt: true,
+    version: toText_(result.version),
+    lastRebuildAt: toText_(result.lastRebuildAt),
+    rowCounts: result.rowCounts,
+    usedBatchGet: Boolean(result.usedBatchGet),
+  };
+}
+
+function getProjectionHealth_() {
+  var meta = readRuntimeMetaMap_();
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+  var interestsSheet = ss.getSheetByName(INTERESTS_SHEET_NAME);
+  var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+  var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
+
+  return {
+    ok: true,
+    version: toText_(meta[PROJECTION_VERSION_KEY]) || "0",
+    lastRebuildAt: toText_(meta[PROJECTION_LAST_REBUILD_KEY]),
+    dirty: toText_(meta[PROJECTION_DIRTY_KEY]) === ACTIVE_FLAG_ON,
+    rowCounts: {
+      listings: listingsSheet ? Math.max(listingsSheet.getLastRow() - 1, 0) : 0,
+      interests: interestsSheet ? Math.max(interestsSheet.getLastRow() - 1, 0) : 0,
+      projection: projectionSheet ? Math.max(projectionSheet.getLastRow() - 1, 0) : 0,
+      listingIndex: listingIndexSheet ? Math.max(listingIndexSheet.getLastRow() - 1, 0) : 0,
+      interestIndex: interestIndexSheet ? Math.max(interestIndexSheet.getLastRow() - 1, 0) : 0,
+    },
+  };
+}
+
 function getListingsVersion_(payload, params) {
+  if (!isProjectionDirty_()) {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var meta = readRuntimeMetaMap_();
+    var totalCount = projectionSheet ? countActiveProjectionRows_(projectionSheet) : 0;
+    return {
+      ok: true,
+      version: toText_(meta[PROJECTION_VERSION_KEY]) || readMarketComputeVersion_(),
+      totalCount: totalCount,
+      generatedAt: toText_(meta[PROJECTION_LAST_REBUILD_KEY]),
+    };
+  }
+
   var summarySnapshot = readListingsSummarySnapshot_();
-  var totalCount = Array.isArray(summarySnapshot.listings) ? summarySnapshot.listings.length : 0;
+  var legacyTotalCount = Array.isArray(summarySnapshot.listings) ? summarySnapshot.listings.length : 0;
   return {
     ok: true,
     version: toText_(summarySnapshot.version) || readMarketComputeVersion_(),
-    totalCount: totalCount,
+    totalCount: legacyTotalCount,
     generatedAt: toText_(summarySnapshot.generatedAt),
   };
 }
@@ -849,20 +1091,54 @@ function addListingsBatchCore_(sellerIdRaw, sellerNameRaw, listings) {
     records.push(buildListingRecordFromPayload_(listings[i] || {}, sellerId, sellerName));
   }
 
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
-  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
-  appendObjectRows_(sheet, LISTINGS_HEADERS, records);
-  invalidateMarketplaceCache_();
+  return withMarketplaceLock_(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
 
-  var listingIds = [];
-  for (var j = 0; j < records.length; j += 1) {
-    listingIds.push(toText_(records[j].listing_id));
-  }
+    assert_(listingsSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+    assert_(projectionSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+    assert_(listingIndexSheet, "sheet not found: " + LISTING_INDEX_SHEET_NAME);
 
-  return {
-    records: records,
-    listingIds: listingIds,
-  };
+    var listingStartRow = appendObjectRowsAndGetStartRow_(listingsSheet, LISTINGS_HEADERS, records);
+    var projectionRecords = [];
+    var listingIndexRecords = [];
+
+    for (var j = 0; j < records.length; j += 1) {
+      var record = records[j];
+      projectionRecords.push(buildProjectionRecordFromListing_(record, [], 0));
+      listingIndexRecords.push({
+        listing_id: toText_(record.listing_id),
+        listings_row: listingStartRow + j,
+        projection_row: 0,
+      });
+    }
+
+    var projectionStartRow = appendObjectRowsAndGetStartRow_(
+      projectionSheet,
+      LISTINGS_PROJECTION_HEADERS,
+      projectionRecords
+    );
+
+    for (var k = 0; k < listingIndexRecords.length; k += 1) {
+      listingIndexRecords[k].projection_row = projectionStartRow + k;
+    }
+    appendObjectRows_(listingIndexSheet, LISTING_INDEX_HEADERS, listingIndexRecords);
+
+    invalidateMarketplaceCache_();
+    markProjectionDirty_(false);
+
+    var listingIds = [];
+    for (var m = 0; m < records.length; m += 1) {
+      listingIds.push(toText_(records[m].listing_id));
+    }
+
+    return {
+      records: records,
+      listingIds: listingIds,
+    };
+  });
 }
 
 function buildListingRecordFromPayload_(listing, sellerId, sellerName) {
@@ -945,62 +1221,77 @@ function updateListing_(payload) {
   assert_(sellerId, "sellerId is required");
   assert_(listingId, "listingId is required");
 
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
-  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
-  if (sheet.getLastRow() <= 1) {
-    throw new Error("listing not found");
-  }
+  return withMarketplaceLock_(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+    assert_(listingsSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+    assert_(projectionSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+    assert_(listingIndexSheet, "sheet not found: " + LISTING_INDEX_SHEET_NAME);
 
-  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, LISTINGS_HEADERS.length).getValues();
-  var listingIndex = LISTINGS_HEADERS.indexOf("listing_id");
-  var sellerIndex = LISTINGS_HEADERS.indexOf("seller_id");
-  var statusIndex = LISTINGS_HEADERS.indexOf("status");
-  var rowToUpdate = 0;
-  var currentRow = null;
-
-  for (var i = 0; i < values.length; i += 1) {
-    var rowListingId = toText_(values[i][listingIndex]);
-    if (rowListingId !== listingId) {
-      continue;
+    var refs = resolveListingRows_(listingId, listingsSheet, projectionSheet, listingIndexSheet);
+    if (!refs.listingsRow) {
+      throw new Error("listing not found");
     }
 
-    var rowSellerId = toText_(values[i][sellerIndex]);
-    if (rowSellerId !== sellerId) {
+    var currentValues = listingsSheet.getRange(refs.listingsRow, 1, 1, LISTINGS_HEADERS.length).getValues()[0];
+    var currentRow = rowValuesToObject_(currentValues, LISTINGS_HEADERS);
+
+    if (toText_(currentRow.seller_id) !== sellerId) {
       throw new Error("only seller can update listing");
     }
-
-    var rowStatus = toText_(values[i][statusIndex]) || DEFAULT_STATUS;
+    var rowStatus = toText_(currentRow.status) || DEFAULT_STATUS;
     if (rowStatus !== DEFAULT_STATUS) {
       throw new Error("only available listing can be updated");
     }
 
-    currentRow = {};
-    for (var j = 0; j < LISTINGS_HEADERS.length; j += 1) {
-      currentRow[LISTINGS_HEADERS[j]] = values[i][j];
+    var nextRow = buildListingRecordForUpdate_(currentRow, listing);
+    listingsSheet
+      .getRange(refs.listingsRow, 1, 1, LISTINGS_HEADERS.length)
+      .setValues([objectToOrderedRow_(nextRow, LISTINGS_HEADERS)]);
+
+    var projectionCurrent = refs.projectionRow
+      ? rowValuesToObject_(
+          projectionSheet.getRange(refs.projectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length).getValues()[0],
+          LISTINGS_PROJECTION_HEADERS
+        )
+      : null;
+    var wantedViewerIds = parseProjectionViewerIds_(projectionCurrent && projectionCurrent.wanted_viewer_ids_json);
+    var wantedCount = parsePositiveInt_(
+      projectionCurrent ? projectionCurrent.wanted_count : wantedViewerIds.length,
+      wantedViewerIds.length,
+      0,
+      1000000
+    );
+    var projectionRecord = buildProjectionRecordFromListing_(nextRow, wantedViewerIds, wantedCount);
+    if (projectionCurrent && toText_(projectionCurrent.projection_row_id)) {
+      projectionRecord.projection_row_id = toText_(projectionCurrent.projection_row_id);
     }
-    rowToUpdate = i + 2;
-    break;
-  }
 
-  if (!rowToUpdate || !currentRow) {
-    throw new Error("listing not found");
-  }
+    var nextProjectionRow = refs.projectionRow;
+    if (nextProjectionRow) {
+      projectionSheet
+        .getRange(nextProjectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length)
+        .setValues([objectToOrderedRow_(projectionRecord, LISTINGS_PROJECTION_HEADERS)]);
+    } else {
+      nextProjectionRow = appendObjectRowsAndGetStartRow_(
+        projectionSheet,
+        LISTINGS_PROJECTION_HEADERS,
+        [projectionRecord]
+      );
+    }
 
-  var nextRow = buildListingRecordForUpdate_(currentRow, listing);
-  var out = [];
-  for (var k = 0; k < LISTINGS_HEADERS.length; k += 1) {
-    var header = LISTINGS_HEADERS[k];
-    out.push(nextRow[header] !== undefined ? nextRow[header] : "");
-  }
+    upsertListingIndexEntry_(listingIndexSheet, listingId, refs.listingsRow, nextProjectionRow);
+    invalidateMarketplaceCache_();
+    markProjectionDirty_(false);
 
-  sheet.getRange(rowToUpdate, 1, 1, LISTINGS_HEADERS.length).setValues([out]);
-  invalidateMarketplaceCache_();
-
-  return {
-    ok: true,
-    listingId: listingId,
-    listing: mapListingRowToResponse_(nextRow, {}, sellerId),
-  };
+    return {
+      ok: true,
+      listingId: listingId,
+      listing: mapListingRowToResponse_(nextRow, {}, sellerId),
+    };
+  });
 }
 
 function addInterest_(payload) {
@@ -1012,40 +1303,102 @@ function addInterest_(payload) {
   assert_(viewerName, "viewerName is required");
   assert_(listingId, "listingId is required");
 
-  var listing = findListingById_(listingId);
-  assert_(listing, "listing not found");
-  if (toText_(listing.seller_id) === viewerId) {
-    throw new Error("cannot add interest to own listing");
-  }
+  return withMarketplaceLock_(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+    var interestsSheet = ss.getSheetByName(INTERESTS_SHEET_NAME);
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+    var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
+    assert_(listingsSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+    assert_(interestsSheet, "sheet not found: " + INTERESTS_SHEET_NAME);
+    assert_(projectionSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+    assert_(listingIndexSheet, "sheet not found: " + LISTING_INDEX_SHEET_NAME);
+    assert_(interestIndexSheet, "sheet not found: " + INTEREST_INDEX_SHEET_NAME);
 
-  var snapshot = readMarketplaceSnapshot_();
-  var interests = snapshot.interests || [];
-  for (var i = 0; i < interests.length; i += 1) {
-    var row = interests[i];
-    if (toText_(row.listing_id) === listingId && toText_(row.viewer_id) === viewerId) {
+    var listingRefs = resolveListingRows_(listingId, listingsSheet, projectionSheet, listingIndexSheet);
+    assert_(listingRefs.listingsRow, "listing not found");
+    var listingRowValues = listingsSheet.getRange(listingRefs.listingsRow, 1, 1, LISTINGS_HEADERS.length).getValues()[0];
+    var listing = rowValuesToObject_(listingRowValues, LISTINGS_HEADERS);
+    var listingStatus = toText_(listing.status) || DEFAULT_STATUS;
+    if (listingStatus !== DEFAULT_STATUS) {
+      throw new Error("listing not available");
+    }
+    if (toText_(listing.seller_id) === viewerId) {
+      throw new Error("cannot add interest to own listing");
+    }
+
+    var interestKey = buildInterestKey_(listingId, viewerId);
+    var interestIndexMap = readInterestIndexMap_(interestIndexSheet);
+    var interestRef = interestIndexMap[interestKey];
+    var existingActiveRows = findInterestRowsByListingAndViewer_(interestsSheet, listingId, viewerId);
+    if (existingActiveRows.length > 0) {
+      upsertInterestIndexEntry_(interestIndexSheet, interestKey, existingActiveRows[0], true);
       return {
         ok: true,
         created: false,
       };
     }
-  }
 
-  var record = {
-    created_at: new Date().toISOString(),
-    interest_id: createId_("interest"),
-    listing_id: listingId,
-    viewer_id: viewerId,
-    viewer_name: viewerName,
-  };
+    if (
+      interestRef &&
+      interestRef.active &&
+      interestRef.interestsRow > 1 &&
+      interestRef.interestsRow <= interestsSheet.getLastRow()
+    ) {
+      var existingInterestValues = interestsSheet
+        .getRange(interestRef.interestsRow, 1, 1, INTERESTS_HEADERS.length)
+        .getValues()[0];
+      if (
+        toText_(existingInterestValues[INTERESTS_HEADERS.indexOf("listing_id")]) === listingId &&
+        toText_(existingInterestValues[INTERESTS_HEADERS.indexOf("viewer_id")]) === viewerId &&
+        isActiveFlag_(existingInterestValues[INTERESTS_HEADERS.indexOf("is_active")], true)
+      ) {
+        return {
+          ok: true,
+          created: false,
+        };
+      }
+    }
 
-  appendObjectRowByName_(INTERESTS_SHEET_NAME, INTERESTS_HEADERS, record);
-  invalidateMarketplaceCache_();
+    var record = {
+      created_at: new Date().toISOString(),
+      interest_id: createId_("interest"),
+      listing_id: listingId,
+      viewer_id: viewerId,
+      viewer_name: viewerName,
+      is_active: ACTIVE_FLAG_ON,
+    };
+    var interestRow = 0;
+    if (interestRef && interestRef.interestsRow > 1) {
+      interestRow = interestRef.interestsRow;
+      interestsSheet
+        .getRange(interestRow, 1, 1, INTERESTS_HEADERS.length)
+        .setValues([objectToOrderedRow_(record, INTERESTS_HEADERS)]);
+      upsertInterestIndexEntry_(interestIndexSheet, interestKey, interestRow, true);
+    } else {
+      interestRow = appendObjectRowsAndGetStartRow_(interestsSheet, INTERESTS_HEADERS, [record]);
+      upsertInterestIndexEntry_(interestIndexSheet, interestKey, interestRow, true);
+    }
 
-  return {
-    ok: true,
-    created: true,
-    interestId: record.interest_id,
-  };
+    var nextProjectionRow = updateProjectionWantedState_(
+      projectionSheet,
+      listingRefs.projectionRow,
+      listing,
+      viewerId,
+      true
+    );
+    upsertListingIndexEntry_(listingIndexSheet, listingId, listingRefs.listingsRow, nextProjectionRow);
+
+    invalidateMarketplaceCache_();
+    markProjectionDirty_(false);
+
+    return {
+      ok: true,
+      created: true,
+      interestId: record.interest_id,
+    };
+  });
 }
 
 function removeInterest_(payload) {
@@ -1055,38 +1408,70 @@ function removeInterest_(payload) {
   assert_(viewerId, "viewerId is required");
   assert_(listingId, "listingId is required");
 
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTERESTS_SHEET_NAME);
-  if (!sheet || sheet.getLastRow() <= 1) {
+  return withMarketplaceLock_(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var interestsSheet = ss.getSheetByName(INTERESTS_SHEET_NAME);
+    var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+    var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
+    if (!interestsSheet || interestsSheet.getLastRow() <= 1) {
+      return {
+        ok: true,
+        removed: false,
+        removedCount: 0,
+      };
+    }
+
+    var listingRefs = resolveListingRows_(listingId, listingsSheet, projectionSheet, listingIndexSheet);
+    var listingRecord = null;
+    if (listingRefs.listingsRow) {
+      listingRecord = rowValuesToObject_(
+        listingsSheet.getRange(listingRefs.listingsRow, 1, 1, LISTINGS_HEADERS.length).getValues()[0],
+        LISTINGS_HEADERS
+      );
+    }
+
+    var interestKey = buildInterestKey_(listingId, viewerId);
+    var interestIndexMap = readInterestIndexMap_(interestIndexSheet);
+    var interestRef = interestIndexMap[interestKey];
+    var removedRows = [];
+
+    if (interestRef && interestRef.interestsRow > 1 && interestRef.active) {
+      interestsSheet
+        .getRange(interestRef.interestsRow, INTERESTS_HEADERS.indexOf("is_active") + 1)
+        .setValue(ACTIVE_FLAG_OFF);
+      upsertInterestIndexEntry_(interestIndexSheet, interestKey, interestRef.interestsRow, false);
+      removedRows.push(interestRef.interestsRow);
+    } else {
+      var fallbackRows = findInterestRowsByListingAndViewer_(interestsSheet, listingId, viewerId);
+      for (var i = 0; i < fallbackRows.length; i += 1) {
+        interestsSheet
+          .getRange(fallbackRows[i], INTERESTS_HEADERS.indexOf("is_active") + 1)
+          .setValue(ACTIVE_FLAG_OFF);
+        removedRows.push(fallbackRows[i]);
+      }
+      if (removedRows.length > 0) {
+        upsertInterestIndexEntry_(interestIndexSheet, interestKey, removedRows[0], false);
+      }
+    }
+
+    if (removedRows.length > 0) {
+      if (listingRefs.projectionRow && listingRecord) {
+        updateProjectionWantedState_(projectionSheet, listingRefs.projectionRow, listingRecord, viewerId, false);
+        markProjectionDirty_(false);
+      } else {
+        markProjectionDirty_(true);
+      }
+      invalidateMarketplaceCache_();
+    }
+
     return {
       ok: true,
-      removed: false,
-      removedCount: 0,
+      removed: removedRows.length > 0,
+      removedCount: removedRows.length,
     };
-  }
-
-  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, INTERESTS_HEADERS.length).getValues();
-  var rowsToDelete = [];
-
-  for (var i = 0; i < values.length; i += 1) {
-    var rowListingId = toText_(values[i][2]);
-    var rowViewerId = toText_(values[i][3]);
-    if (rowListingId === listingId && rowViewerId === viewerId) {
-      rowsToDelete.push(i + 2);
-    }
-  }
-
-  for (var j = rowsToDelete.length - 1; j >= 0; j -= 1) {
-    sheet.deleteRow(rowsToDelete[j]);
-  }
-  if (rowsToDelete.length > 0) {
-    invalidateMarketplaceCache_();
-  }
-
-  return {
-    ok: true,
-    removed: rowsToDelete.length > 0,
-    removedCount: rowsToDelete.length,
-  };
+  });
 }
 
 function cancelListing_(payload) {
@@ -1096,30 +1481,30 @@ function cancelListing_(payload) {
   assert_(sellerId, "sellerId is required");
   assert_(listingId, "listingId is required");
 
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
-  assert_(sheet, "sheet not found: " + LISTINGS_SHEET_NAME);
-  if (sheet.getLastRow() <= 1) {
-    throw new Error("listing not found");
-  }
+  return withMarketplaceLock_(function () {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+    var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+    var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+    var interestsSheet = ss.getSheetByName(INTERESTS_SHEET_NAME);
+    var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
 
-  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, LISTINGS_HEADERS.length).getValues();
-  var rowToUpdate = 0;
-  var statusIndex = LISTINGS_HEADERS.indexOf("status");
-  var sellerIndex = LISTINGS_HEADERS.indexOf("seller_id");
-  var listingIndex = LISTINGS_HEADERS.indexOf("listing_id");
+    assert_(listingsSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+    assert_(projectionSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+    assert_(listingIndexSheet, "sheet not found: " + LISTING_INDEX_SHEET_NAME);
 
-  for (var i = 0; i < values.length; i += 1) {
-    var rowListingId = toText_(values[i][listingIndex]);
-    if (rowListingId !== listingId) {
-      continue;
+    var refs = resolveListingRows_(listingId, listingsSheet, projectionSheet, listingIndexSheet);
+    if (!refs.listingsRow) {
+      throw new Error("listing not found");
     }
 
-    var rowSellerId = toText_(values[i][sellerIndex]);
-    if (rowSellerId !== sellerId) {
+    var currentValues = listingsSheet.getRange(refs.listingsRow, 1, 1, LISTINGS_HEADERS.length).getValues()[0];
+    var currentRow = rowValuesToObject_(currentValues, LISTINGS_HEADERS);
+    if (toText_(currentRow.seller_id) !== sellerId) {
       throw new Error("only seller can cancel listing");
     }
 
-    var rowStatus = toText_(values[i][statusIndex]) || DEFAULT_STATUS;
+    var rowStatus = toText_(currentRow.status) || DEFAULT_STATUS;
     if (rowStatus !== DEFAULT_STATUS) {
       return {
         ok: true,
@@ -1128,45 +1513,64 @@ function cancelListing_(payload) {
       };
     }
 
-    rowToUpdate = i + 2;
-    break;
-  }
+    currentRow.status = "CANCELLED";
+    listingsSheet
+      .getRange(refs.listingsRow, 1, 1, LISTINGS_HEADERS.length)
+      .setValues([objectToOrderedRow_(currentRow, LISTINGS_HEADERS)]);
 
-  if (!rowToUpdate) {
-    throw new Error("listing not found");
-  }
+    var removedCount = removeInterestsByListingId_(listingId, interestsSheet, interestIndexSheet);
 
-  sheet.getRange(rowToUpdate, statusIndex + 1).setValue("CANCELLED");
-  removeInterestsByListingId_(listingId);
-  invalidateMarketplaceCache_();
+    var nextProjectionRow = updateProjectionStatusOnly_(
+      projectionSheet,
+      refs.projectionRow,
+      currentRow,
+      "CANCELLED",
+      ACTIVE_FLAG_OFF,
+      []
+    );
+    upsertListingIndexEntry_(listingIndexSheet, listingId, refs.listingsRow, nextProjectionRow);
 
-  return {
-    ok: true,
-    cancelled: true,
-    listingId: listingId,
-  };
+    invalidateMarketplaceCache_();
+    markProjectionDirty_(false);
+
+    return {
+      ok: true,
+      cancelled: true,
+      listingId: listingId,
+      removedInterests: removedCount,
+    };
+  });
 }
 
-function removeInterestsByListingId_(listingId) {
-  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTERESTS_SHEET_NAME);
+function removeInterestsByListingId_(listingId, interestsSheetArg, interestIndexSheetArg) {
+  var sheet = interestsSheetArg || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTERESTS_SHEET_NAME);
   if (!sheet || sheet.getLastRow() <= 1) {
     return 0;
   }
 
+  var interestIndexSheet =
+    interestIndexSheetArg || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTEREST_INDEX_SHEET_NAME);
   var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, INTERESTS_HEADERS.length).getValues();
-  var rowsToDelete = [];
+  var rowsToDeactivate = [];
 
   for (var i = 0; i < values.length; i += 1) {
     var rowListingId = toText_(values[i][2]);
-    if (rowListingId === listingId) {
-      rowsToDelete.push(i + 2);
+    var activeRaw = values[i][INTERESTS_HEADERS.indexOf("is_active")];
+    if (rowListingId === listingId && isActiveFlag_(activeRaw, true)) {
+      rowsToDeactivate.push(i + 2);
     }
   }
 
-  for (var j = rowsToDelete.length - 1; j >= 0; j -= 1) {
-    sheet.deleteRow(rowsToDelete[j]);
+  for (var j = 0; j < rowsToDeactivate.length; j += 1) {
+    var rowNumber = rowsToDeactivate[j];
+    sheet.getRange(rowNumber, INTERESTS_HEADERS.indexOf("is_active") + 1).setValue(ACTIVE_FLAG_OFF);
+    var rowValues = sheet.getRange(rowNumber, 1, 1, INTERESTS_HEADERS.length).getValues()[0];
+    var key = buildInterestKey_(rowValues[2], rowValues[3]);
+    if (interestIndexSheet && toText_(rowValues[2]) && toText_(rowValues[3])) {
+      upsertInterestIndexEntry_(interestIndexSheet, key, rowNumber, false);
+    }
   }
-  return rowsToDelete.length;
+  return rowsToDeactivate.length;
 }
 
 function listMyPage_(payload, params) {
@@ -1314,6 +1718,9 @@ function buildGroupedInterests_(interests) {
   var groupedInterests = {};
   for (var i = 0; i < interests.length; i += 1) {
     var interest = interests[i];
+    if (!isActiveFlag_(interest.is_active, true)) {
+      continue;
+    }
     var listingId = toText_(interest.listing_id);
     var currentViewerId = toText_(interest.viewer_id);
     if (!listingId || !currentViewerId) {
@@ -1452,6 +1859,823 @@ function mapListingRowToResponse_(row, interestMap, viewerId) {
     wantedCount: wantedBy.length,
     alreadyWanted: Boolean(!ownListing && viewerId && interestMap && interestMap[viewerId]),
     wantedBy: wantedBy,
+  };
+}
+
+function withMarketplaceLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(MARKET_LOCK_WAIT_MS);
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function isActiveFlag_(value, fallback) {
+  var text = toText_(value).toLowerCase();
+  if (!text) {
+    return Boolean(fallback);
+  }
+  if (text === ACTIVE_FLAG_ON || text === "true" || text === "active" || text === "yes") {
+    return true;
+  }
+  if (text === ACTIVE_FLAG_OFF || text === "false" || text === "inactive" || text === "no") {
+    return false;
+  }
+  return Boolean(fallback);
+}
+
+function rowValuesToObject_(values, headers) {
+  var rowValues = Array.isArray(values) ? values : [];
+  var row = {};
+  for (var i = 0; i < headers.length; i += 1) {
+    row[headers[i]] = i < rowValues.length ? rowValues[i] : "";
+  }
+  return row;
+}
+
+function objectToOrderedRow_(obj, headers) {
+  var record = obj || {};
+  var row = [];
+  for (var i = 0; i < headers.length; i += 1) {
+    var key = headers[i];
+    row.push(record[key] !== undefined ? record[key] : "");
+  }
+  return row;
+}
+
+function appendObjectRowsAndGetStartRow_(sheet, headers, records) {
+  if (!records || !records.length) {
+    return 0;
+  }
+  var startRow = sheet.getLastRow() + 1;
+  appendObjectRows_(sheet, headers, records);
+  return startRow;
+}
+
+function buildInterestKey_(listingId, viewerId) {
+  return toText_(listingId) + "|" + toText_(viewerId);
+}
+
+function parseProjectionViewerIds_(value) {
+  if (!value) {
+    return [];
+  }
+  var ids = parseJsonArray_(value);
+  return sanitizeTextArray_(ids, 1000);
+}
+
+function buildProjectionRecordFromListing_(listingRow, wantedViewerIds, wantedCount) {
+  var row = listingRow || {};
+  var status = toText_(row.status) || DEFAULT_STATUS;
+  var variants = resolveListingImageVariants_(row);
+  var viewerIds = sanitizeTextArray_(wantedViewerIds, 1000);
+  var count = parsePositiveInt_(wantedCount, viewerIds.length, 0, 1000000);
+  if (count < viewerIds.length) {
+    count = viewerIds.length;
+  }
+  var subjectTags = parseJsonArray_(row.subject_tags_json);
+
+  return {
+    projection_row_id: createId_("projection"),
+    created_at: toText_(row.created_at),
+    listing_id: toText_(row.listing_id),
+    item_type: normalizeItemType_(row.item_type),
+    category: toText_(row.category),
+    title: toText_(row.title),
+    thumb_url: variants.thumbUrl,
+    detail_image_url: variants.detailImageUrl,
+    jan: normalizeJan_(row.jan),
+    subject_tags_json: JSON.stringify(subjectTags),
+    author: toText_(row.author),
+    publisher: toText_(row.publisher),
+    seller_name: toText_(row.seller_name),
+    seller_id: toText_(row.seller_id),
+    status: status,
+    is_active: status === DEFAULT_STATUS ? ACTIVE_FLAG_ON : ACTIVE_FLAG_OFF,
+    wanted_count: count,
+    wanted_viewer_ids_json: JSON.stringify(viewerIds),
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function mapProjectionRowToSummaryResponse_(row, viewerId) {
+  var projectionRow = row || {};
+  var wantedViewerIds = parseProjectionViewerIds_(projectionRow.wanted_viewer_ids_json);
+  var wantedCount = parsePositiveInt_(projectionRow.wanted_count, wantedViewerIds.length, 0, 1000000);
+  var sellerId = toText_(projectionRow.seller_id);
+  var ownListing = Boolean(viewerId && sellerId === viewerId);
+  var alreadyWanted = Boolean(!ownListing && viewerId && wantedViewerIds.indexOf(viewerId) !== -1);
+
+  return {
+    createdAt: toText_(projectionRow.created_at),
+    listingId: toText_(projectionRow.listing_id),
+    itemType: normalizeItemType_(projectionRow.item_type),
+    category: toText_(projectionRow.category),
+    title: toText_(projectionRow.title),
+    thumbUrl: normalizeImageUrl_(projectionRow.thumb_url),
+    detailImageUrl: normalizeImageUrl_(projectionRow.detail_image_url),
+    jan: normalizeJan_(projectionRow.jan),
+    subjectTags: parseJsonArray_(projectionRow.subject_tags_json),
+    author: toText_(projectionRow.author),
+    publisher: toText_(projectionRow.publisher),
+    sellerName: toText_(projectionRow.seller_name),
+    sellerId: sellerId,
+    status: toText_(projectionRow.status) || DEFAULT_STATUS,
+    wantedCount: wantedCount,
+    alreadyWanted: alreadyWanted,
+  };
+}
+
+function countActiveProjectionRows_(sheet) {
+  var projectionSheet = sheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  if (!projectionSheet || projectionSheet.getLastRow() <= 1) {
+    return 0;
+  }
+
+  var activeColumn = LISTINGS_PROJECTION_HEADERS.indexOf("is_active") + 1;
+  var values = projectionSheet.getRange(2, activeColumn, projectionSheet.getLastRow() - 1, 1).getValues();
+  var count = 0;
+  for (var i = 0; i < values.length; i += 1) {
+    if (isActiveFlag_(values[i][0], false)) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function readProjectionChunkFromTail_(sheet, activeOffset, chunkSize) {
+  var projectionSheet = sheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  if (!projectionSheet || projectionSheet.getLastRow() <= 1) {
+    return {
+      rows: [],
+      totalActive: 0,
+    };
+  }
+
+  var values = projectionSheet
+    .getRange(2, 1, projectionSheet.getLastRow() - 1, LISTINGS_PROJECTION_HEADERS.length)
+    .getValues();
+  var offset = parsePositiveInt_(activeOffset, 0, 0, 10000000);
+  var maxRows = parsePositiveInt_(chunkSize, 80, 1, 2000);
+  var skipped = 0;
+  var rows = [];
+  var totalActive = 0;
+
+  for (var i = values.length - 1; i >= 0; i -= 1) {
+    var row = rowValuesToObject_(values[i], LISTINGS_PROJECTION_HEADERS);
+    if (!isActiveFlag_(row.is_active, false)) {
+      continue;
+    }
+
+    totalActive += 1;
+    if (skipped < offset) {
+      skipped += 1;
+      continue;
+    }
+
+    if (rows.length < maxRows) {
+      rows.push(row);
+    }
+  }
+
+  return {
+    rows: rows,
+    totalActive: totalActive,
+  };
+}
+
+function ensureRuntimeMetaDefaults_(runtimeMetaSheet) {
+  var sheet = runtimeMetaSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RUNTIME_META_SHEET_NAME);
+  if (!sheet) {
+    return;
+  }
+  var meta = readRuntimeMetaMap_(sheet);
+  var updates = {};
+
+  if (!toText_(meta[PROJECTION_VERSION_KEY])) {
+    updates[PROJECTION_VERSION_KEY] = String(new Date().getTime());
+  }
+  if (!toText_(meta[PROJECTION_LAST_REBUILD_KEY])) {
+    updates[PROJECTION_LAST_REBUILD_KEY] = "";
+  }
+  if (!toText_(meta[PROJECTION_DIRTY_KEY])) {
+    updates[PROJECTION_DIRTY_KEY] = ACTIVE_FLAG_OFF;
+  }
+
+  if (objectKeys_(updates).length > 0) {
+    writeRuntimeMetaValues_(updates, sheet);
+  }
+}
+
+function readRuntimeMetaMap_(runtimeMetaSheet) {
+  var sheet = runtimeMetaSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RUNTIME_META_SHEET_NAME);
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return {};
+  }
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+  var meta = {};
+  for (var i = 0; i < values.length; i += 1) {
+    var key = toText_(values[i][0]);
+    if (!key) {
+      continue;
+    }
+    meta[key] = toText_(values[i][1]);
+  }
+  return meta;
+}
+
+function writeRuntimeMetaValues_(updates, runtimeMetaSheet) {
+  var sheet = runtimeMetaSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(RUNTIME_META_SHEET_NAME);
+  if (!sheet) {
+    return;
+  }
+
+  var keys = objectKeys_(updates);
+  if (!keys.length) {
+    return;
+  }
+
+  var keyToRow = {};
+  if (sheet.getLastRow() > 1) {
+    var currentValues = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+    for (var i = 0; i < currentValues.length; i += 1) {
+      var currentKey = toText_(currentValues[i][0]);
+      if (!currentKey) {
+        continue;
+      }
+      keyToRow[currentKey] = i + 2;
+    }
+  }
+
+  var rowsToAppend = [];
+  for (var j = 0; j < keys.length; j += 1) {
+    var key = toText_(keys[j]);
+    if (!key) {
+      continue;
+    }
+    var value = toText_(updates[key]);
+    var targetRow = keyToRow[key];
+    if (targetRow) {
+      sheet.getRange(targetRow, 2).setValue(value);
+    } else {
+      rowsToAppend.push([key, value]);
+    }
+  }
+
+  if (rowsToAppend.length) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, 2).setValues(rowsToAppend);
+  }
+}
+
+function readProjectionVersion_() {
+  var meta = readRuntimeMetaMap_();
+  return toText_(meta[PROJECTION_VERSION_KEY]) || "0";
+}
+
+function touchProjectionVersion_() {
+  writeRuntimeMetaValues_(
+    (function () {
+      var out = {};
+      out[PROJECTION_VERSION_KEY] = String(new Date().getTime());
+      return out;
+    })()
+  );
+}
+
+function markProjectionDirty_(dirty) {
+  writeRuntimeMetaValues_(
+    (function () {
+      var out = {};
+      out[PROJECTION_DIRTY_KEY] = dirty ? ACTIVE_FLAG_ON : ACTIVE_FLAG_OFF;
+      return out;
+    })()
+  );
+}
+
+function isProjectionDirty_() {
+  var meta = readRuntimeMetaMap_();
+  return toText_(meta[PROJECTION_DIRTY_KEY]) === ACTIVE_FLAG_ON;
+}
+
+function findRowByColumnValue_(sheet, columnIndex, targetValue) {
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return 0;
+  }
+
+  var expected = toText_(targetValue);
+  if (!expected) {
+    return 0;
+  }
+
+  var values = sheet.getRange(2, columnIndex, sheet.getLastRow() - 1, 1).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    if (toText_(values[i][0]) === expected) {
+      return i + 2;
+    }
+  }
+  return 0;
+}
+
+function resolveListingRows_(listingId, listingsSheet, projectionSheet, listingIndexSheet) {
+  var listSheet = listingsSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_SHEET_NAME);
+  var projSheet =
+    projectionSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  var indexSheet = listingIndexSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTING_INDEX_SHEET_NAME);
+  assert_(listSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+  assert_(projSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+
+  var targetListingId = toText_(listingId);
+  if (!targetListingId) {
+    return {
+      listingsRow: 0,
+      projectionRow: 0,
+    };
+  }
+
+  var indexRow = findRowByColumnValue_(indexSheet, 1, targetListingId);
+  var listingsRow = 0;
+  var projectionRow = 0;
+  if (indexRow > 1) {
+    var indexValues = indexSheet.getRange(indexRow, 1, 1, LISTING_INDEX_HEADERS.length).getValues()[0];
+    listingsRow = parsePositiveInt_(indexValues[1], 0, 0, 100000000);
+    projectionRow = parsePositiveInt_(indexValues[2], 0, 0, 100000000);
+  }
+
+  var listingsIdColumn = LISTINGS_HEADERS.indexOf("listing_id") + 1;
+  if (
+    !listingsRow ||
+    listingsRow < 2 ||
+    listingsRow > listSheet.getLastRow() ||
+    toText_(listSheet.getRange(listingsRow, listingsIdColumn).getValue()) !== targetListingId
+  ) {
+    listingsRow = findRowByColumnValue_(listSheet, listingsIdColumn, targetListingId);
+  }
+
+  var projectionIdColumn = LISTINGS_PROJECTION_HEADERS.indexOf("listing_id") + 1;
+  if (
+    !projectionRow ||
+    projectionRow < 2 ||
+    projectionRow > projSheet.getLastRow() ||
+    toText_(projSheet.getRange(projectionRow, projectionIdColumn).getValue()) !== targetListingId
+  ) {
+    projectionRow = findRowByColumnValue_(projSheet, projectionIdColumn, targetListingId);
+  }
+
+  if (listingsRow || projectionRow) {
+    upsertListingIndexEntry_(indexSheet, targetListingId, listingsRow, projectionRow);
+  }
+
+  return {
+    listingsRow: listingsRow,
+    projectionRow: projectionRow,
+  };
+}
+
+function upsertListingIndexEntry_(listingIndexSheet, listingId, listingsRow, projectionRow) {
+  var sheet =
+    listingIndexSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTING_INDEX_SHEET_NAME);
+  if (!sheet) {
+    return;
+  }
+
+  var key = toText_(listingId);
+  if (!key) {
+    return;
+  }
+
+  var rowToWrite = findRowByColumnValue_(sheet, 1, key);
+  var record = {
+    listing_id: key,
+    listings_row: parsePositiveInt_(listingsRow, 0, 0, 100000000),
+    projection_row: parsePositiveInt_(projectionRow, 0, 0, 100000000),
+  };
+
+  if (rowToWrite > 1) {
+    sheet
+      .getRange(rowToWrite, 1, 1, LISTING_INDEX_HEADERS.length)
+      .setValues([objectToOrderedRow_(record, LISTING_INDEX_HEADERS)]);
+  } else {
+    appendObjectRows_(sheet, LISTING_INDEX_HEADERS, [record]);
+  }
+}
+
+function readInterestIndexMap_(interestIndexSheet) {
+  var sheet =
+    interestIndexSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTEREST_INDEX_SHEET_NAME);
+  var map = {};
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return map;
+  }
+
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, INTEREST_INDEX_HEADERS.length).getValues();
+  for (var i = 0; i < values.length; i += 1) {
+    var key = toText_(values[i][0]);
+    if (!key) {
+      continue;
+    }
+    map[key] = {
+      indexRow: i + 2,
+      interestsRow: parsePositiveInt_(values[i][1], 0, 0, 100000000),
+      active: isActiveFlag_(values[i][2], false),
+    };
+  }
+  return map;
+}
+
+function upsertInterestIndexEntry_(interestIndexSheet, interestKey, interestsRow, active) {
+  var sheet =
+    interestIndexSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(INTEREST_INDEX_SHEET_NAME);
+  if (!sheet) {
+    return;
+  }
+
+  var key = toText_(interestKey);
+  if (!key) {
+    return;
+  }
+
+  var rowToWrite = findRowByColumnValue_(sheet, 1, key);
+  var record = {
+    interest_key: key,
+    interests_row: parsePositiveInt_(interestsRow, 0, 0, 100000000),
+    is_active: active ? ACTIVE_FLAG_ON : ACTIVE_FLAG_OFF,
+  };
+
+  if (rowToWrite > 1) {
+    sheet
+      .getRange(rowToWrite, 1, 1, INTEREST_INDEX_HEADERS.length)
+      .setValues([objectToOrderedRow_(record, INTEREST_INDEX_HEADERS)]);
+  } else {
+    appendObjectRows_(sheet, INTEREST_INDEX_HEADERS, [record]);
+  }
+}
+
+function findInterestRowsByListingAndViewer_(interestsSheet, listingId, viewerId) {
+  if (!interestsSheet || interestsSheet.getLastRow() <= 1) {
+    return [];
+  }
+
+  var out = [];
+  var values = interestsSheet.getRange(2, 1, interestsSheet.getLastRow() - 1, INTERESTS_HEADERS.length).getValues();
+  var listingIndex = INTERESTS_HEADERS.indexOf("listing_id");
+  var viewerIndex = INTERESTS_HEADERS.indexOf("viewer_id");
+  var activeIndex = INTERESTS_HEADERS.indexOf("is_active");
+
+  for (var i = 0; i < values.length; i += 1) {
+    var rowListingId = toText_(values[i][listingIndex]);
+    var rowViewerId = toText_(values[i][viewerIndex]);
+    var rowActive = values[i][activeIndex];
+    if (rowListingId !== toText_(listingId) || rowViewerId !== toText_(viewerId)) {
+      continue;
+    }
+    if (!isActiveFlag_(rowActive, true)) {
+      continue;
+    }
+    out.push(i + 2);
+  }
+
+  return out;
+}
+
+function updateProjectionWantedState_(projectionSheet, projectionRow, listingRecord, viewerId, shouldAdd) {
+  var sheet =
+    projectionSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  if (!sheet) {
+    throw new Error("sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+  }
+
+  var nextProjectionRow = parsePositiveInt_(projectionRow, 0, 0, 100000000);
+  var current = null;
+  if (nextProjectionRow > 1 && nextProjectionRow <= sheet.getLastRow()) {
+    current = rowValuesToObject_(
+      sheet.getRange(nextProjectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length).getValues()[0],
+      LISTINGS_PROJECTION_HEADERS
+    );
+  }
+
+  var viewerIds = parseProjectionViewerIds_(current ? current.wanted_viewer_ids_json : "");
+  var targetViewerId = toText_(viewerId);
+  var pos = viewerIds.indexOf(targetViewerId);
+  if (shouldAdd) {
+    if (targetViewerId && pos === -1) {
+      viewerIds.push(targetViewerId);
+    }
+  } else if (pos !== -1) {
+    viewerIds.splice(pos, 1);
+  }
+
+  if (current) {
+    current.wanted_count = viewerIds.length;
+    current.wanted_viewer_ids_json = JSON.stringify(viewerIds);
+    current.updated_at = new Date().toISOString();
+    sheet
+      .getRange(nextProjectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length)
+      .setValues([objectToOrderedRow_(current, LISTINGS_PROJECTION_HEADERS)]);
+    return nextProjectionRow;
+  }
+
+  var listing = listingRecord || {};
+  var nextRecord = buildProjectionRecordFromListing_(listing, viewerIds, viewerIds.length);
+  nextProjectionRow = appendObjectRowsAndGetStartRow_(sheet, LISTINGS_PROJECTION_HEADERS, [nextRecord]);
+  return nextProjectionRow;
+}
+
+function updateProjectionStatusOnly_(
+  projectionSheet,
+  projectionRow,
+  listingRecord,
+  nextStatus,
+  nextIsActive,
+  nextWantedViewerIds
+) {
+  var sheet =
+    projectionSheet || SpreadsheetApp.getActiveSpreadsheet().getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  if (!sheet) {
+    throw new Error("sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+  }
+
+  var current = null;
+  if (projectionRow > 1 && projectionRow <= sheet.getLastRow()) {
+    current = rowValuesToObject_(
+      sheet.getRange(projectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length).getValues()[0],
+      LISTINGS_PROJECTION_HEADERS
+    );
+  }
+
+  var viewerIds = Array.isArray(nextWantedViewerIds)
+    ? sanitizeTextArray_(nextWantedViewerIds, 1000)
+    : parseProjectionViewerIds_(current ? current.wanted_viewer_ids_json : "");
+  var nextRecord = buildProjectionRecordFromListing_(listingRecord || {}, viewerIds, viewerIds.length);
+  nextRecord.status = toText_(nextStatus) || nextRecord.status;
+  nextRecord.is_active = isActiveFlag_(nextIsActive, false) ? ACTIVE_FLAG_ON : ACTIVE_FLAG_OFF;
+  if (current && toText_(current.projection_row_id)) {
+    nextRecord.projection_row_id = toText_(current.projection_row_id);
+  }
+
+  if (projectionRow > 1 && projectionRow <= sheet.getLastRow()) {
+    sheet
+      .getRange(projectionRow, 1, 1, LISTINGS_PROJECTION_HEADERS.length)
+      .setValues([objectToOrderedRow_(nextRecord, LISTINGS_PROJECTION_HEADERS)]);
+    return projectionRow;
+  }
+
+  return appendObjectRowsAndGetStartRow_(sheet, LISTINGS_PROJECTION_HEADERS, [nextRecord]);
+}
+
+function readSheetRowsWithRowNumber_(sheet, headers) {
+  if (!sheet || sheet.getLastRow() <= 1) {
+    return [];
+  }
+  var values = sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues();
+  var rows = [];
+  for (var i = 0; i < values.length; i += 1) {
+    rows.push({
+      rowNumber: i + 2,
+      row: rowValuesToObject_(values[i], headers),
+    });
+  }
+  return rows;
+}
+
+function valueRangeToRowsWithRowNumber_(values, headers) {
+  var matrix = Array.isArray(values) ? values : [];
+  if (matrix.length <= 1) {
+    return [];
+  }
+
+  var headerRow = matrix[0] || [];
+  var headerIndex = {};
+  for (var i = 0; i < headers.length; i += 1) {
+    headerIndex[headers[i]] = -1;
+    for (var j = 0; j < headerRow.length; j += 1) {
+      if (toText_(headerRow[j]) === headers[i]) {
+        headerIndex[headers[i]] = j;
+        break;
+      }
+    }
+  }
+
+  var out = [];
+  for (var r = 1; r < matrix.length; r += 1) {
+    var rowValues = matrix[r] || [];
+    var row = {};
+    for (var h = 0; h < headers.length; h += 1) {
+      var key = headers[h];
+      var idx = headerIndex[key];
+      row[key] = idx >= 0 && idx < rowValues.length ? rowValues[idx] : "";
+    }
+    out.push({
+      rowNumber: r + 1,
+      row: row,
+    });
+  }
+  return out;
+}
+
+function readRowsViaBatchGet_(spreadsheetId) {
+  if (
+    typeof Sheets === "undefined" ||
+    !Sheets.Spreadsheets ||
+    !Sheets.Spreadsheets.Values ||
+    !Sheets.Spreadsheets.Values.batchGet
+  ) {
+    return {
+      ok: false,
+      usedBatchGet: false,
+      listings: [],
+      interests: [],
+    };
+  }
+
+  try {
+    var response = Sheets.Spreadsheets.Values.batchGet(spreadsheetId, {
+      ranges: [LISTINGS_SHEET_NAME + "!A:Z", INTERESTS_SHEET_NAME + "!A:Z"],
+      majorDimension: "ROWS",
+    });
+    var valueRanges = (response && response.valueRanges) || [];
+    return {
+      ok: true,
+      usedBatchGet: true,
+      listings: valueRangeToRowsWithRowNumber_(
+        valueRanges[0] ? valueRanges[0].values : [],
+        LISTINGS_HEADERS
+      ),
+      interests: valueRangeToRowsWithRowNumber_(
+        valueRanges[1] ? valueRanges[1].values : [],
+        INTERESTS_HEADERS
+      ),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      usedBatchGet: false,
+      listings: [],
+      interests: [],
+    };
+  }
+}
+
+function rewriteSheetWithObjects_(sheet, headers, records) {
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+
+  if (!records || !records.length) {
+    return;
+  }
+
+  var chunkSize = 500;
+  for (var i = 0; i < records.length; i += chunkSize) {
+    var chunk = records.slice(i, i + chunkSize);
+    var rows = [];
+    for (var j = 0; j < chunk.length; j += 1) {
+      rows.push(objectToOrderedRow_(chunk[j], headers));
+    }
+    sheet.getRange(i + 2, 1, rows.length, headers.length).setValues(rows);
+  }
+}
+
+function rebuildProjectionInternal_(spreadsheet, useBatchGet) {
+  var ss = spreadsheet || SpreadsheetApp.getActiveSpreadsheet();
+  var listingsSheet = ss.getSheetByName(LISTINGS_SHEET_NAME);
+  var interestsSheet = ss.getSheetByName(INTERESTS_SHEET_NAME);
+  var projectionSheet = ss.getSheetByName(LISTINGS_PROJECTION_SHEET_NAME);
+  var listingIndexSheet = ss.getSheetByName(LISTING_INDEX_SHEET_NAME);
+  var interestIndexSheet = ss.getSheetByName(INTEREST_INDEX_SHEET_NAME);
+  var runtimeMetaSheet = ss.getSheetByName(RUNTIME_META_SHEET_NAME);
+
+  assert_(listingsSheet, "sheet not found: " + LISTINGS_SHEET_NAME);
+  assert_(interestsSheet, "sheet not found: " + INTERESTS_SHEET_NAME);
+  assert_(projectionSheet, "sheet not found: " + LISTINGS_PROJECTION_SHEET_NAME);
+  assert_(listingIndexSheet, "sheet not found: " + LISTING_INDEX_SHEET_NAME);
+  assert_(interestIndexSheet, "sheet not found: " + INTEREST_INDEX_SHEET_NAME);
+  assert_(runtimeMetaSheet, "sheet not found: " + RUNTIME_META_SHEET_NAME);
+
+  var startedAtMs = new Date().getTime();
+  var batchRead = {
+    ok: false,
+    usedBatchGet: false,
+    listings: [],
+    interests: [],
+  };
+  if (useBatchGet) {
+    batchRead = readRowsViaBatchGet_(ss.getId());
+  }
+
+  var listingRows = batchRead.ok ? batchRead.listings : readSheetRowsWithRowNumber_(listingsSheet, LISTINGS_HEADERS);
+  var interestRows = batchRead.ok
+    ? batchRead.interests
+    : readSheetRowsWithRowNumber_(interestsSheet, INTERESTS_HEADERS);
+
+  var listingMap = {};
+  var listingOrder = [];
+  for (var i = 0; i < listingRows.length; i += 1) {
+    var listingRow = listingRows[i].row || {};
+    var listingId = toText_(listingRow.listing_id);
+    if (!listingId) {
+      continue;
+    }
+    if (!listingMap[listingId]) {
+      listingOrder.push(listingId);
+    }
+    listingMap[listingId] = {
+      rowNumber: listingRows[i].rowNumber,
+      row: listingRow,
+    };
+  }
+
+  var interestIndexMap = {};
+  var groupedByListing = {};
+  for (var j = 0; j < interestRows.length; j += 1) {
+    var interestRow = interestRows[j].row || {};
+    var interestListingId = toText_(interestRow.listing_id);
+    var interestViewerId = toText_(interestRow.viewer_id);
+    if (!interestListingId || !interestViewerId) {
+      continue;
+    }
+
+    var interestKey = buildInterestKey_(interestListingId, interestViewerId);
+    var interestActive = isActiveFlag_(interestRow.is_active, true);
+    interestIndexMap[interestKey] = {
+      interest_key: interestKey,
+      interests_row: interestRows[j].rowNumber,
+      is_active: interestActive ? ACTIVE_FLAG_ON : ACTIVE_FLAG_OFF,
+    };
+
+    if (!groupedByListing[interestListingId]) {
+      groupedByListing[interestListingId] = {};
+    }
+    if (interestActive) {
+      groupedByListing[interestListingId][interestViewerId] = {
+        viewerId: interestViewerId,
+        viewerName: toText_(interestRow.viewer_name),
+      };
+    } else {
+      delete groupedByListing[interestListingId][interestViewerId];
+    }
+  }
+
+  var projectionRecords = [];
+  var listingIndexRecords = [];
+  for (var k = 0; k < listingOrder.length; k += 1) {
+    var id = listingOrder[k];
+    var listingEntry = listingMap[id];
+    if (!listingEntry) {
+      continue;
+    }
+    var grouped = groupedByListing[id] || {};
+    var viewerIds = objectKeys_(grouped);
+    var projectionRecord = buildProjectionRecordFromListing_(listingEntry.row, viewerIds, viewerIds.length);
+    projectionRecords.push(projectionRecord);
+    listingIndexRecords.push({
+      listing_id: id,
+      listings_row: listingEntry.rowNumber,
+      projection_row: projectionRecords.length + 1,
+    });
+  }
+
+  var interestIndexRecords = objectValues_(interestIndexMap);
+
+  rewriteSheetWithObjects_(projectionSheet, LISTINGS_PROJECTION_HEADERS, projectionRecords);
+  rewriteSheetWithObjects_(listingIndexSheet, LISTING_INDEX_HEADERS, listingIndexRecords);
+  rewriteSheetWithObjects_(interestIndexSheet, INTEREST_INDEX_HEADERS, interestIndexRecords);
+
+  var nowIso = new Date().toISOString();
+  var nextVersion = String(new Date().getTime());
+  writeRuntimeMetaValues_(
+    (function () {
+      var updates = {};
+      updates[PROJECTION_VERSION_KEY] = nextVersion;
+      updates[PROJECTION_LAST_REBUILD_KEY] = nowIso;
+      updates[PROJECTION_DIRTY_KEY] = ACTIVE_FLAG_OFF;
+      return updates;
+    })(),
+    runtimeMetaSheet
+  );
+
+  removeFromCache_(MARKET_SNAPSHOT_CACHE_KEY);
+  bumpMarketComputeVersion_();
+
+  console.log(
+    "[projection] rebuilt listings=%s interests=%s elapsedMs=%s",
+    String(projectionRecords.length),
+    String(interestRows.length),
+    String(new Date().getTime() - startedAtMs)
+  );
+
+  return {
+    version: nextVersion,
+    lastRebuildAt: nowIso,
+    usedBatchGet: batchRead.ok && batchRead.usedBatchGet,
+    rowCounts: {
+      listings: listingRows.length,
+      interests: interestRows.length,
+      projection: projectionRecords.length,
+      listingIndex: listingIndexRecords.length,
+      interestIndex: interestIndexRecords.length,
+    },
   };
 }
 
