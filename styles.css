@@ -423,6 +423,20 @@ button:focus-visible {
   gap: 10px;
 }
 
+.book-action-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.isbn-scanner-video {
+  width: 100%;
+  max-height: 260px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: #0f1218;
+  object-fit: cover;
+}
+
 .subject-tags {
   display: flex;
   flex-wrap: wrap;

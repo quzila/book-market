@@ -52,6 +52,10 @@ import "./config.js";
   const IMAGE_UPLOAD_CONCURRENCY = 3;
   const UPLOAD_MAX_EDGE = 1800;
   const UPLOAD_JPEG_QUALITY = 0.84;
+  const SCAN_FRAME_INTERVAL_MS = 180;
+  const SCAN_DUPLICATE_COOLDOWN_MS = 1500;
+  const SCAN_JAN_NOTICE_COOLDOWN_MS = 1200;
+  const SCAN_RECENT_ISBN_TTL_MS = 15000;
 
   const state = {
     apiBaseUrl: sanitizeUrl(APP_CONFIG.APPS_SCRIPT_BASE_URL || FIXED_APPS_SCRIPT_BASE_URL),
@@ -86,6 +90,17 @@ import "./config.js";
       draftQueue: [],
       editingListingId: "",
       editingImageUrls: [],
+      scannerActive: false,
+      scannerStream: null,
+      barcodeDetector: null,
+      scanLoopRafId: 0,
+      scanLastFrameAt: 0,
+      scanDetectBusy: false,
+      scanQueueBusy: false,
+      pendingIsbnQueue: [],
+      recentSeenIsbn: {},
+      lastJanNoticeAt: 0,
+      listingActionBusy: false,
     },
   };
 
@@ -94,6 +109,7 @@ import "./config.js";
     openLoginButton: byId("openLoginButton"),
     logoutButton: byId("logoutButton"),
 
+    searchPill: byId("searchPill"),
     searchInput: byId("searchInput"),
     quickCategoryRow: byId("quickCategoryRow"),
 
@@ -115,6 +131,9 @@ import "./config.js";
     janInput: byId("janInput"),
     lookupBookButton: byId("lookupBookButton"),
     lookupStatus: byId("lookupStatus"),
+    toggleIsbnScanButton: byId("toggleIsbnScanButton"),
+    scanStatus: byId("scanStatus"),
+    isbnScannerVideo: byId("isbnScannerVideo"),
     authorInput: byId("authorInput"),
     publisherInput: byId("publisherInput"),
     publishedDateInput: byId("publishedDateInput"),
@@ -184,6 +203,7 @@ import "./config.js";
     renderQueuedListings();
     renderSessionState();
     switchTab(state.activeTab, { persist: false });
+    syncIsbnScannerUi();
     queueSubjectTagsRender();
     hydrateListingsFromCache();
     refreshListings();
@@ -192,6 +212,7 @@ import "./config.js";
   function ensureRequiredDom() {
     const required = [
       "openLoginButton",
+      "searchPill",
       "searchInput",
       "quickCategoryRow",
       "bottomNav",
@@ -201,6 +222,9 @@ import "./config.js";
       "listingGrid",
       "listingForm",
       "queueListingButton",
+      "toggleIsbnScanButton",
+      "scanStatus",
+      "isbnScannerVideo",
       "queuedListingsList",
       "myConflictSection",
       "loginModal",
@@ -269,6 +293,7 @@ import "./config.js";
 
     dom.itemTypeInput.addEventListener("change", syncBookFieldVisibility);
     dom.lookupBookButton.addEventListener("click", handleBookLookup);
+    dom.toggleIsbnScanButton.addEventListener("click", toggleIsbnScanner);
     dom.janInput.addEventListener("keydown", (event) => {
       if (event.key === "Enter") {
         event.preventDefault();
@@ -324,6 +349,9 @@ import "./config.js";
     dom.detailWantButton.addEventListener("click", handleListingActionClick);
     dom.detailWishersButton.addEventListener("click", handleListingActionClick);
     document.addEventListener("keydown", handleGlobalKeyDown);
+    window.addEventListener("pagehide", () => {
+      stopIsbnScanner({ silent: true, clearStatus: true });
+    });
   }
 
   function byId(id) {
@@ -368,17 +396,21 @@ import "./config.js";
       button.classList.toggle("is-active", isActive);
     });
 
+    dom.searchPill.classList.toggle("hidden", target !== "home");
     dom.quickCategoryRow.classList.toggle("hidden", target !== "home");
 
     applyAccessState();
 
     if (target === "plus") {
       ensureSubjectTagsRendered();
+    } else {
+      stopIsbnScanner({ silent: true, clearStatus: true });
     }
 
     if (target === "my") {
       refreshMyPage();
     }
+    syncIsbnScannerUi();
   }
 
   function renderSessionState() {
@@ -417,6 +449,10 @@ import "./config.js";
     return Boolean(normalizeText(state.seller.editingListingId));
   }
 
+  function canUseIsbnScanner() {
+    return canCreateListing() && state.activeTab === "plus" && normalizeItemType(dom.itemTypeInput.value) === "book";
+  }
+
   function applyAccessState() {
     const loggedIn = Boolean(state.session);
     const canPost = canCreateListing();
@@ -433,7 +469,11 @@ import "./config.js";
     dom.submitListingButton.disabled = !canPost;
     dom.queueListingButton.disabled = !canPost;
     dom.myConflictSection.classList.toggle("hidden", !canViewConflictSection());
+    if (!canUseIsbnScanner() && state.seller.scannerActive) {
+      stopIsbnScanner({ silent: true, clearStatus: true });
+    }
     updateListingFormMode();
+    syncIsbnScannerUi();
   }
 
   function updateListingFormMode() {
@@ -597,6 +637,7 @@ import "./config.js";
   }
 
   function handleLogout() {
+    stopIsbnScanner({ silent: true, clearStatus: true });
     state.session = null;
     state.detailCache = {};
     state.requests.detailByListingId = {};
@@ -1510,16 +1551,356 @@ import "./config.js";
     renderSubjectTags();
   }
 
+  function syncIsbnScannerUi() {
+    const active = Boolean(state.seller.scannerActive);
+    dom.toggleIsbnScanButton.textContent = active ? "スキャン停止" : "ISBNを連続スキャン";
+    dom.toggleIsbnScanButton.disabled = state.seller.listingActionBusy || (!active && !canUseIsbnScanner());
+    dom.isbnScannerVideo.classList.toggle("hidden", !active);
+  }
+
+  async function resolveBarcodeDetector() {
+    if (!("BarcodeDetector" in window)) {
+      return null;
+    }
+    if (state.seller.barcodeDetector) {
+      return state.seller.barcodeDetector;
+    }
+
+    try {
+      if (typeof window.BarcodeDetector.getSupportedFormats === "function") {
+        const formats = await window.BarcodeDetector.getSupportedFormats();
+        if (Array.isArray(formats) && formats.includes("ean_13")) {
+          state.seller.barcodeDetector = new window.BarcodeDetector({ formats: ["ean_13"] });
+          return state.seller.barcodeDetector;
+        }
+      }
+    } catch {
+      // fall back to default detector
+    }
+
+    state.seller.barcodeDetector = new window.BarcodeDetector();
+    return state.seller.barcodeDetector;
+  }
+
+  async function toggleIsbnScanner() {
+    if (state.seller.scannerActive) {
+      stopIsbnScanner();
+      return;
+    }
+    await startIsbnScanner();
+  }
+
+  async function startIsbnScanner() {
+    if (state.seller.scannerActive) {
+      return;
+    }
+    if (!canUseIsbnScanner()) {
+      setStatus(dom.scanStatus, "出品タブの書籍フォームでログインした状態で開始してください。", "error");
+      syncIsbnScannerUi();
+      return;
+    }
+    if (state.seller.draftQueue.length >= MAX_BATCH_LISTINGS) {
+      setStatus(dom.scanStatus, `一括出品は最大${MAX_BATCH_LISTINGS}件までです。`, "error");
+      return;
+    }
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
+      setStatus(dom.scanStatus, "この端末ではカメラを利用できません。ISBNを手入力してください。", "error");
+      return;
+    }
+
+    const detector = await resolveBarcodeDetector();
+    if (!detector) {
+      setStatus(dom.scanStatus, "この端末ではバーコード読取に未対応です。ISBNを手入力してください。", "error");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+
+      state.seller.scannerStream = stream;
+      state.seller.scannerActive = true;
+      state.seller.scanLastFrameAt = 0;
+      state.seller.scanDetectBusy = false;
+      state.seller.scanQueueBusy = false;
+      state.seller.pendingIsbnQueue = [];
+      state.seller.lastJanNoticeAt = 0;
+
+      dom.isbnScannerVideo.srcObject = stream;
+      try {
+        await dom.isbnScannerVideo.play();
+      } catch {
+        // Some browsers start playback after user gesture only.
+      }
+
+      setStatus(dom.scanStatus, "ISBNを読み取り中です。");
+      syncIsbnScannerUi();
+      scanFrameLoop();
+    } catch (error) {
+      stopIsbnScanner({ silent: true, clearStatus: false });
+      setStatus(dom.scanStatus, `カメラを開始できませんでした: ${String(error.message || error)}`, "error");
+    }
+  }
+
+  function stopIsbnScanner(options = {}) {
+    const silent = Boolean(options.silent);
+    const clearStatus = Boolean(options.clearStatus);
+    const hadScanner = Boolean(state.seller.scannerActive || state.seller.scannerStream);
+
+    state.seller.scannerActive = false;
+    state.seller.scanDetectBusy = false;
+    state.seller.scanQueueBusy = false;
+    state.seller.pendingIsbnQueue = [];
+    state.seller.lastJanNoticeAt = 0;
+
+    if (state.seller.scanLoopRafId) {
+      window.cancelAnimationFrame(state.seller.scanLoopRafId);
+      state.seller.scanLoopRafId = 0;
+    }
+
+    if (state.seller.scannerStream) {
+      state.seller.scannerStream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore track stop failures
+        }
+      });
+      state.seller.scannerStream = null;
+    }
+
+    if (dom.isbnScannerVideo) {
+      try {
+        dom.isbnScannerVideo.pause();
+      } catch {
+        // ignore pause failures
+      }
+      dom.isbnScannerVideo.srcObject = null;
+    }
+
+    if (clearStatus) {
+      setStatus(dom.scanStatus, "");
+    } else if (!silent && hadScanner) {
+      setStatus(dom.scanStatus, "スキャンを停止しました。");
+    }
+
+    syncIsbnScannerUi();
+  }
+
+  function scanFrameLoop(timestamp = 0) {
+    if (!state.seller.scannerActive) {
+      return;
+    }
+    state.seller.scanLoopRafId = window.requestAnimationFrame(scanFrameLoop);
+    if (state.seller.scanDetectBusy) {
+      return;
+    }
+    if (timestamp - state.seller.scanLastFrameAt < SCAN_FRAME_INTERVAL_MS) {
+      return;
+    }
+    state.seller.scanLastFrameAt = timestamp;
+    void runBarcodeDetection();
+  }
+
+  async function runBarcodeDetection() {
+    if (!state.seller.scannerActive || state.seller.scanDetectBusy) {
+      return;
+    }
+    if (!state.seller.barcodeDetector) {
+      return;
+    }
+    if (dom.isbnScannerVideo.readyState < 2) {
+      return;
+    }
+
+    state.seller.scanDetectBusy = true;
+    try {
+      const detections = await state.seller.barcodeDetector.detect(dom.isbnScannerVideo);
+      if (!Array.isArray(detections) || !detections.length) {
+        return;
+      }
+
+      for (const detection of detections) {
+        const code = extractIsbnCandidate(detection?.rawValue);
+        if (!code) {
+          continue;
+        }
+        if (isJanBookCode(code)) {
+          enqueueDetectedIsbn(code);
+          return;
+        }
+        if (/^\d{13}$/.test(code)) {
+          const now = Date.now();
+          if (now - state.seller.lastJanNoticeAt > SCAN_JAN_NOTICE_COOLDOWN_MS) {
+            state.seller.lastJanNoticeAt = now;
+            setStatus(dom.scanStatus, `JAN ${code} を検出しました。ISBNを待機しています。`);
+          }
+        }
+      }
+    } catch (error) {
+      const message = String(error?.message || error || "");
+      if (message && !/InvalidStateError|AbortError/i.test(message)) {
+        setStatus(dom.scanStatus, `読み取りエラー: ${message}`, "error");
+      }
+    } finally {
+      state.seller.scanDetectBusy = false;
+    }
+  }
+
+  function extractIsbnCandidate(rawValue) {
+    const digits = normalizeJan(rawValue);
+    if (!digits) {
+      return "";
+    }
+    if (/^\d{13}$/.test(digits)) {
+      return digits;
+    }
+    const match = digits.match(/97[89]\d{10}/);
+    return match ? match[0] : "";
+  }
+
+  function enqueueDetectedIsbn(isbn) {
+    if (!state.seller.scannerActive) {
+      return;
+    }
+    const normalized = normalizeJan(isbn);
+    if (!isJanBookCode(normalized)) {
+      return;
+    }
+
+    const now = Date.now();
+    pruneRecentSeenIsbn(now);
+    const lastSeenAt = Number(state.seller.recentSeenIsbn[normalized] || 0);
+    if (lastSeenAt && now - lastSeenAt < SCAN_DUPLICATE_COOLDOWN_MS) {
+      return;
+    }
+    state.seller.recentSeenIsbn[normalized] = now;
+
+    if (!state.seller.pendingIsbnQueue.includes(normalized)) {
+      state.seller.pendingIsbnQueue.push(normalized);
+    }
+
+    void processDetectedIsbnQueue();
+  }
+
+  function pruneRecentSeenIsbn(now = Date.now()) {
+    Object.keys(state.seller.recentSeenIsbn).forEach((key) => {
+      const seenAt = Number(state.seller.recentSeenIsbn[key] || 0);
+      if (!seenAt || now - seenAt > SCAN_RECENT_ISBN_TTL_MS) {
+        delete state.seller.recentSeenIsbn[key];
+      }
+    });
+  }
+
+  async function processDetectedIsbnQueue() {
+    if (state.seller.scanQueueBusy) {
+      return;
+    }
+    state.seller.scanQueueBusy = true;
+
+    try {
+      while (state.seller.scannerActive && state.seller.pendingIsbnQueue.length) {
+        if (state.seller.draftQueue.length >= MAX_BATCH_LISTINGS) {
+          setStatus(dom.scanStatus, `一括出品は最大${MAX_BATCH_LISTINGS}件までです。`, "error");
+          stopIsbnScanner({ silent: true });
+          break;
+        }
+
+        const isbn = normalizeJan(state.seller.pendingIsbnQueue.shift());
+        if (!isJanBookCode(isbn)) {
+          continue;
+        }
+
+        if (isDuplicateDraftIsbn(isbn)) {
+          const proceed = window.confirm(`ISBN ${isbn} は既に登録予定にあります。重複して追加しますか？`);
+          if (!proceed) {
+            setStatus(dom.scanStatus, `ISBN ${isbn} の重複追加をスキップしました。`);
+            continue;
+          }
+        }
+
+        try {
+          await queueDetectedIsbn(isbn);
+        } catch (error) {
+          setStatus(dom.scanStatus, String(error.message || error), "error");
+        }
+      }
+    } finally {
+      state.seller.scanQueueBusy = false;
+    }
+  }
+
+  function isDuplicateDraftIsbn(isbn) {
+    const normalized = normalizeJan(isbn);
+    if (!normalized) {
+      return false;
+    }
+    return state.seller.draftQueue.some((draft) => normalizeJan(draft?.listing?.jan) === normalized);
+  }
+
+  async function queueDetectedIsbn(isbn) {
+    dom.itemTypeInput.value = "book";
+    syncBookFieldVisibility();
+
+    setStatus(dom.scanStatus, `ISBN ${isbn} を処理中...`);
+    setStatus(dom.lookupStatus, "書誌情報を取得中...");
+
+    let meta = null;
+    try {
+      meta = await lookupBookByJan(isbn, { forceRefresh: false });
+      state.seller.currentBookMeta = meta;
+      state.seller.currentJan = isbn;
+      applyBookMetaToForm(isbn, meta);
+
+      const hasCover = Boolean(meta.coverUrl || meta.coverCandidates.length);
+      const hasSummary = Boolean(meta.summary);
+      if (hasCover && hasSummary) {
+        setStatus(dom.lookupStatus, "書誌情報を取得しました。", "ok");
+      } else {
+        setStatus(dom.lookupStatus, "一部の情報のみ取得しました。必要なら写真を追加してください。", "ok");
+      }
+    } catch (error) {
+      state.seller.currentBookMeta = null;
+      state.seller.currentJan = isbn;
+      applyBookMetaToForm(isbn, null);
+      setStatus(dom.lookupStatus, `書誌情報取得に失敗しました: ${String(error.message || error)}`, "error");
+    }
+
+    await queueCurrentFormDraft({ keepScanner: true, successMessage: "" });
+    setStatus(dom.scanStatus, `ISBN ${isbn} を追加しました（登録予定 ${state.seller.draftQueue.length}件）。`, "ok");
+  }
+
+  function applyBookMetaToForm(isbn, meta) {
+    const normalizedIsbn = normalizeJan(isbn);
+    dom.itemTypeInput.value = "book";
+    dom.categoryInput.value = normalizeText(dom.categoryInput.value) || defaultCategory("book");
+    dom.janInput.value = normalizedIsbn;
+    dom.titleInput.value = normalizeText(meta?.title) || `ISBN ${normalizedIsbn}`;
+    dom.descriptionInput.value = normalizeText(meta?.summary);
+    dom.authorInput.value = normalizeText(meta?.author);
+    dom.publisherInput.value = normalizeText(meta?.publisher);
+    dom.publishedDateInput.value = normalizeText(meta?.publishedDate);
+  }
+
   function syncBookFieldVisibility() {
     ensureSubjectTagsRendered();
     const isBook = dom.itemTypeInput.value === "book";
     dom.bookFields.classList.toggle("hidden", !isBook);
     if (!isBook) {
+      stopIsbnScanner({ silent: true, clearStatus: true });
       dom.janInput.value = "";
       state.seller.currentBookMeta = null;
       state.seller.currentJan = "";
       setStatus(dom.lookupStatus, "");
+      setStatus(dom.scanStatus, "");
     }
+    syncIsbnScannerUi();
   }
 
   function renderSubjectTags() {
@@ -1637,6 +2018,7 @@ import "./config.js";
       return;
     }
 
+    stopIsbnScanner({ silent: true, clearStatus: true });
     setListingActionBusy(true);
     try {
       const editingListingId = normalizeText(state.seller.editingListingId);
@@ -1738,6 +2120,21 @@ import "./config.js";
     }
   }
 
+  async function queueCurrentFormDraft(options = {}) {
+    const keepScanner = Boolean(options.keepScanner);
+    const successMessage =
+      options.successMessage === undefined ? "商品を登録しました。続けて入力できます。" : options.successMessage;
+
+    const draft = await buildListingDraftFromForm();
+    state.seller.draftQueue.push(draft);
+    renderQueuedListings();
+    resetListingFormInputs({ keepScanner });
+    if (successMessage) {
+      setStatus(dom.listingStatus, String(successMessage), "ok");
+    }
+    return draft;
+  }
+
   async function handleQueueListing() {
     if (!state.session) {
       openLoginModal();
@@ -1759,11 +2156,7 @@ import "./config.js";
 
     setListingActionBusy(true);
     try {
-      const draft = await buildListingDraftFromForm();
-      state.seller.draftQueue.push(draft);
-      renderQueuedListings();
-      resetListingFormInputs();
-      setStatus(dom.listingStatus, "商品を登録しました。続けて入力できます。", "ok");
+      await queueCurrentFormDraft();
     } catch (error) {
       setStatus(dom.listingStatus, String(error.message || error), "error");
     } finally {
@@ -1913,7 +2306,11 @@ import "./config.js";
     };
   }
 
-  function resetListingFormInputs() {
+  function resetListingFormInputs(options = {}) {
+    const keepScanner = Boolean(options.keepScanner);
+    if (!keepScanner) {
+      stopIsbnScanner({ silent: true, clearStatus: true });
+    }
     dom.listingForm.reset();
     clearPreviewObjectUrls();
     dom.imagePreview.innerHTML = "";
@@ -1921,6 +2318,9 @@ import "./config.js";
     state.seller.currentJan = "";
     clearEditingListingMode();
     setStatus(dom.lookupStatus, "");
+    if (!keepScanner) {
+      setStatus(dom.scanStatus, "");
+    }
     syncBookFieldVisibility();
   }
 
@@ -1943,8 +2343,10 @@ import "./config.js";
   }
 
   function setListingActionBusy(isBusy) {
+    state.seller.listingActionBusy = Boolean(isBusy);
     dom.submitListingButton.disabled = isBusy;
     dom.queueListingButton.disabled = isBusy;
+    syncIsbnScannerUi();
   }
 
   function clearPreviewObjectUrls() {
