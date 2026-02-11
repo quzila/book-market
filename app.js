@@ -53,9 +53,9 @@ import "./config.js";
   const UPLOAD_MAX_EDGE = 1800;
   const UPLOAD_JPEG_QUALITY = 0.84;
   const SCAN_FRAME_INTERVAL_MS = 180;
-  const SCAN_DUPLICATE_COOLDOWN_MS = 1500;
   const SCAN_JAN_NOTICE_COOLDOWN_MS = 1200;
-  const SCAN_RECENT_ISBN_TTL_MS = 15000;
+  const ZXING_ESM_URL = "https://cdn.jsdelivr.net/npm/@zxing/browser@0.1.5/+esm";
+  const SCAN_MANUAL_MESSAGE = "ISBNを手入力してください。";
 
   const state = {
     apiBaseUrl: sanitizeUrl(APP_CONFIG.APPS_SCRIPT_BASE_URL || FIXED_APPS_SCRIPT_BASE_URL),
@@ -93,12 +93,13 @@ import "./config.js";
       scannerActive: false,
       scannerStream: null,
       barcodeDetector: null,
+      zxingModule: null,
+      zxingControls: null,
       scanLoopRafId: 0,
       scanLastFrameAt: 0,
       scanDetectBusy: false,
       scanQueueBusy: false,
       pendingIsbnQueue: [],
-      recentSeenIsbn: {},
       lastJanNoticeAt: 0,
       listingActionBusy: false,
     },
@@ -410,7 +411,6 @@ import "./config.js";
     if (target === "my") {
       refreshMyPage();
     }
-    syncIsbnScannerUi();
   }
 
   function renderSessionState() {
@@ -1558,7 +1558,7 @@ import "./config.js";
     dom.isbnScannerVideo.classList.toggle("hidden", !active);
   }
 
-  async function resolveBarcodeDetector() {
+  function resolveBarcodeDetector() {
     if (!("BarcodeDetector" in window)) {
       return null;
     }
@@ -1567,19 +1567,48 @@ import "./config.js";
     }
 
     try {
-      if (typeof window.BarcodeDetector.getSupportedFormats === "function") {
-        const formats = await window.BarcodeDetector.getSupportedFormats();
-        if (Array.isArray(formats) && formats.includes("ean_13")) {
-          state.seller.barcodeDetector = new window.BarcodeDetector({ formats: ["ean_13"] });
-          return state.seller.barcodeDetector;
-        }
-      }
+      state.seller.barcodeDetector = new window.BarcodeDetector({ formats: ["ean_13"] });
     } catch {
-      // fall back to default detector
+      return null;
+    }
+    return state.seller.barcodeDetector;
+  }
+
+  async function loadZxingModule() {
+    if (state.seller.zxingModule) {
+      return state.seller.zxingModule;
     }
 
-    state.seller.barcodeDetector = new window.BarcodeDetector();
-    return state.seller.barcodeDetector;
+    try {
+      const imported = await import(/* @vite-ignore */ ZXING_ESM_URL);
+      const candidate = imported && typeof imported.BrowserMultiFormatReader === "function" ? imported : null;
+      if (!candidate) {
+        return null;
+      }
+      state.seller.zxingModule = candidate;
+      return candidate;
+    } catch {
+      return null;
+    }
+  }
+
+  function handleDetectedRawValue(rawValue) {
+    const code = extractIsbnCandidate(rawValue);
+    if (!code) {
+      return false;
+    }
+    if (isJanBookCode(code)) {
+      enqueueDetectedIsbn(code);
+      return true;
+    }
+    if (/^\d{13}$/.test(code)) {
+      const now = Date.now();
+      if (now - state.seller.lastJanNoticeAt > SCAN_JAN_NOTICE_COOLDOWN_MS) {
+        state.seller.lastJanNoticeAt = now;
+        setStatus(dom.scanStatus, `JAN検出 (${code}) / ISBN待機中`);
+      }
+    }
+    return false;
   }
 
   async function toggleIsbnScanner() {
@@ -1595,8 +1624,7 @@ import "./config.js";
       return;
     }
     if (!canUseIsbnScanner()) {
-      setStatus(dom.scanStatus, "出品タブの書籍フォームでログインした状態で開始してください。", "error");
-      syncIsbnScannerUi();
+      setStatus(dom.scanStatus, "ログイン後に開始してください。", "error");
       return;
     }
     if (state.seller.draftQueue.length >= MAX_BATCH_LISTINGS) {
@@ -1604,26 +1632,34 @@ import "./config.js";
       return;
     }
     if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== "function") {
-      setStatus(dom.scanStatus, "この端末ではカメラを利用できません。ISBNを手入力してください。", "error");
+      setStatus(dom.scanStatus, SCAN_MANUAL_MESSAGE, "error");
       return;
     }
 
-    const detector = await resolveBarcodeDetector();
-    if (!detector) {
-      setStatus(dom.scanStatus, "この端末ではバーコード読取に未対応です。ISBNを手入力してください。", "error");
+    const detector = resolveBarcodeDetector();
+    if (detector) {
+      await startNativeIsbnScanner(detector);
       return;
     }
 
+    const zxingModule = await loadZxingModule();
+    if (zxingModule) {
+      await startZxingIsbnScanner(zxingModule);
+      return;
+    }
+
+    setStatus(dom.scanStatus, SCAN_MANUAL_MESSAGE, "error");
+  }
+
+  async function startNativeIsbnScanner(detector) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
         video: {
           facingMode: { ideal: "environment" },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
         },
       });
 
+      state.seller.barcodeDetector = detector;
       state.seller.scannerStream = stream;
       state.seller.scannerActive = true;
       state.seller.scanLastFrameAt = 0;
@@ -1633,25 +1669,76 @@ import "./config.js";
       state.seller.lastJanNoticeAt = 0;
 
       dom.isbnScannerVideo.srcObject = stream;
-      try {
-        await dom.isbnScannerVideo.play();
-      } catch {
-        // Some browsers start playback after user gesture only.
-      }
+      await dom.isbnScannerVideo.play().catch(() => {});
 
-      setStatus(dom.scanStatus, "ISBNを読み取り中です。");
+      setStatus(dom.scanStatus, "ISBN読取中");
       syncIsbnScannerUi();
       scanFrameLoop();
     } catch (error) {
       stopIsbnScanner({ silent: true, clearStatus: false });
-      setStatus(dom.scanStatus, `カメラを開始できませんでした: ${String(error.message || error)}`, "error");
+      setStatus(dom.scanStatus, `開始失敗: ${String(error.message || error)}`, "error");
+    }
+  }
+
+  async function startZxingIsbnScanner(zxingModule) {
+    const ReaderCtor = zxingModule?.BrowserMultiFormatReader;
+    if (typeof ReaderCtor !== "function") {
+      setStatus(dom.scanStatus, SCAN_MANUAL_MESSAGE, "error");
+      return;
+    }
+
+    const reader = new ReaderCtor(undefined, 300);
+    state.seller.scannerActive = true;
+    state.seller.scanQueueBusy = false;
+    state.seller.pendingIsbnQueue = [];
+    state.seller.lastJanNoticeAt = 0;
+    setStatus(dom.scanStatus, "ISBN読取中");
+    syncIsbnScannerUi();
+
+    try {
+      const controls = await reader.decodeFromConstraints(
+        {
+          video: {
+            facingMode: { ideal: "environment" },
+          },
+        },
+        dom.isbnScannerVideo,
+        (result) => {
+          if (!state.seller.scannerActive) {
+            return;
+          }
+          if (result) {
+            const rawValue = typeof result.getText === "function" ? result.getText() : result.text;
+            handleDetectedRawValue(rawValue);
+          }
+        }
+      );
+
+      if (!state.seller.scannerActive) {
+        try {
+          controls?.stop?.();
+        } catch {
+          // ignore stop failures during race
+        }
+        return;
+      }
+
+      state.seller.zxingControls = controls || null;
+      const activeStream = dom.isbnScannerVideo.srcObject;
+      if (activeStream && typeof activeStream.getTracks === "function") {
+        state.seller.scannerStream = activeStream;
+      }
+      await dom.isbnScannerVideo.play().catch(() => {});
+    } catch (error) {
+      stopIsbnScanner({ silent: true, clearStatus: false });
+      setStatus(dom.scanStatus, `開始失敗: ${String(error.message || error)}`, "error");
     }
   }
 
   function stopIsbnScanner(options = {}) {
     const silent = Boolean(options.silent);
     const clearStatus = Boolean(options.clearStatus);
-    const hadScanner = Boolean(state.seller.scannerActive || state.seller.scannerStream);
+    const hadScanner = Boolean(state.seller.scannerActive || state.seller.scannerStream || state.seller.zxingControls);
 
     state.seller.scannerActive = false;
     state.seller.scanDetectBusy = false;
@@ -1663,6 +1750,15 @@ import "./config.js";
       window.cancelAnimationFrame(state.seller.scanLoopRafId);
       state.seller.scanLoopRafId = 0;
     }
+
+    if (state.seller.zxingControls && typeof state.seller.zxingControls.stop === "function") {
+      try {
+        state.seller.zxingControls.stop();
+      } catch {
+        // ignore stop failures
+      }
+    }
+    state.seller.zxingControls = null;
 
     if (state.seller.scannerStream) {
       state.seller.scannerStream.getTracks().forEach((track) => {
@@ -1687,7 +1783,7 @@ import "./config.js";
     if (clearStatus) {
       setStatus(dom.scanStatus, "");
     } else if (!silent && hadScanner) {
-      setStatus(dom.scanStatus, "スキャンを停止しました。");
+      setStatus(dom.scanStatus, "停止しました。");
     }
 
     syncIsbnScannerUi();
@@ -1727,20 +1823,8 @@ import "./config.js";
       }
 
       for (const detection of detections) {
-        const code = extractIsbnCandidate(detection?.rawValue);
-        if (!code) {
-          continue;
-        }
-        if (isJanBookCode(code)) {
-          enqueueDetectedIsbn(code);
+        if (handleDetectedRawValue(detection?.rawValue)) {
           return;
-        }
-        if (/^\d{13}$/.test(code)) {
-          const now = Date.now();
-          if (now - state.seller.lastJanNoticeAt > SCAN_JAN_NOTICE_COOLDOWN_MS) {
-            state.seller.lastJanNoticeAt = now;
-            setStatus(dom.scanStatus, `JAN ${code} を検出しました。ISBNを待機しています。`);
-          }
         }
       }
     } catch (error) {
@@ -1774,28 +1858,11 @@ import "./config.js";
       return;
     }
 
-    const now = Date.now();
-    pruneRecentSeenIsbn(now);
-    const lastSeenAt = Number(state.seller.recentSeenIsbn[normalized] || 0);
-    if (lastSeenAt && now - lastSeenAt < SCAN_DUPLICATE_COOLDOWN_MS) {
-      return;
-    }
-    state.seller.recentSeenIsbn[normalized] = now;
-
     if (!state.seller.pendingIsbnQueue.includes(normalized)) {
       state.seller.pendingIsbnQueue.push(normalized);
     }
 
     void processDetectedIsbnQueue();
-  }
-
-  function pruneRecentSeenIsbn(now = Date.now()) {
-    Object.keys(state.seller.recentSeenIsbn).forEach((key) => {
-      const seenAt = Number(state.seller.recentSeenIsbn[key] || 0);
-      if (!seenAt || now - seenAt > SCAN_RECENT_ISBN_TTL_MS) {
-        delete state.seller.recentSeenIsbn[key];
-      }
-    });
   }
 
   async function processDetectedIsbnQueue() {
